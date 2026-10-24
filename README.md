@@ -1,6 +1,6 @@
 <div align="center">
 
-# maibot-mimotts-voice
+# maibot-mimotts-voice-pro
 
 **让 MaiBot 里的 AI 角色真的开口说话**
 
@@ -288,6 +288,11 @@ A：不用。配置热重载会重建 TTS 服务，密钥/音色/超时/调音�
 本 fork 采用同样的 `send.custom("voice", raw_base64)` 思路，并在此之上补完了错误处理链路。
 
 原作者与许可证信息保留在 [LICENSE](./LICENSE) 与 `_manifest.json` 的 `author` 字段中。
+
+> **插件 ID 已改为 `m1o0.maibot-mimotts-voice-pro`。**
+> 上游 ID 是 `Emilia-awa.maibot-mimotts-voice`，两者不同是有意为之——
+> 这样你可以把原版和本 fork 装在同一套 MaiBot 里对比，不会因为 ID 相同而互相覆盖。
+> 代价是：从原版迁过来时，配置和音色不会自动继承，需要重新填一次。
 
 **同步上游更新：**
 

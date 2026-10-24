@@ -1,17 +1,18 @@
 {
   "manifest_version": 2,
-  "id": "Emilia-awa.maibot-mimotts-voice",
-  "name": "MiMo TTS Voice Clone",
+  "id": "m1o0.maibot-mimotts-voice-pro",
+  "name": "MiMo TTS Voice Clone (Pro)",
   "version": "1.9.0",
-  "description": "MiMo TTS Voice Clone Plugin for MaiBot - AI语音回复插件，支持自定义音色克隆和风格控制",
+  "description": "MiMo TTS Voice Clone Plugin for MaiBot - 语音回复插件，带请求超时、退避重试、并发上限与失败自动退回文字，并支持 ffmpeg 本地音高/语速/响度调整",
   "author": {
     "name": "Emilia-awa",
     "url": "https://github.com/Emilia-awa"
   },
   "license": "MIT",
   "urls": {
-    "repository": "https://github.com/Emilia-awa/maibot-mimotts-voice",
-    "homepage": "https://github.com/Emilia-awa/maibot-mimotts-voice"
+    "repository": "https://github.com/m1o0/maibot-mimotts-voice-pro",
+    "homepage": "https://github.com/m1o0/maibot-mimotts-voice-pro",
+    "issues": "https://github.com/m1o0/maibot-mimotts-voice-pro/issues"
   },
   "host_application": {
     "min_version": "1.0.0",
