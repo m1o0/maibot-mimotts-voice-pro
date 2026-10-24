@@ -2,6 +2,30 @@
 
 本文件记录插件各版本的变化。遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.9.4] - 2026-10-24
+
+按第三轮审核意见收尾。审核确认无阻断项，这里是两条「顺手看一眼」的建议。
+
+### 修复
+
+- **`_ensure_config_exists()` 是死代码，已删除**。它原本在 `on_load` 里把
+  `config.example.toml` 复制成 `config.toml`，但这个时机太晚了：宿主的
+  `_prepare_plugin_activation()` 在 `on_load` **之前**就已经调
+  `_apply_plugin_config()`，那里对 `config.toml` 不存在的情况会直接用
+  `tomlkit` 按 `config_model` 生成一份完整配置（`runner_main.py:966-969` 的
+  `should_initialize_file`）。所以插件这段复制从来没生效过 —— 线上 `config.toml`
+  只有 2 行注释、`config.example.toml` 有 26 行，就是宿主生成而非本插件复制的证据。
+- **`voices_dir` 不存在时不再在插件源码目录里 `mkdir`**。`paths` 约定要求插件只往
+  `data_dir` / `runtime_dir` 写；在源码目录建空文件夹既会被 `.gitignore` 吞掉，
+  又会让用户误以为放进去的文件会被同步。改成只告警、告诉用户该建哪个目录。
+
+### 变更
+
+- **`voice_clone_tts` 的 API 描述补上副作用说明**。这个 API 保持 `public=True`
+  （上游原有设计，TTS 作为对外能力本来就该可被调用），但原描述只写
+  "TTS with specified voice"，没提「传 `stream_id` 会真的发语音出去」。
+  现在描述里写明这一点，README 也新增「对外接口」一节说明调用方式和 `stream_id` 语义。
+
 ## [1.9.3] - 2026-10-24
 
 按第二轮市场审核意见修掉三处边界问题。都是「正常情况下碰不到，碰到就麻烦」的类型。

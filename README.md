@@ -6,7 +6,7 @@
 
 基于小米 MiMo-V2.5-TTS 的语音插件，把文字回复变成有情绪、有音色、有停顿的语音。
 
-![version](https://img.shields.io/badge/version-1.9.3-blue)
+![version](https://img.shields.io/badge/version-1.9.4-blue)
 ![python](https://img.shields.io/badge/python-3.9%2B-3776AB)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![platform](https://img.shields.io/badge/MaiBot-%E2%89%A51.0.0-orange)
@@ -29,7 +29,7 @@
 
 上游版本停在 v1.6.0（2026-05），这个 fork 在其基础上重做了错误处理链路，并新增本地音频后处理。
 
-| | 上游 v1.6.0 | 本 fork v1.9.3 |
+| | 上游 v1.6.0 | 本 fork v1.9.4 |
 |---|---|---|
 | 聊天流定位 | 拿不到时取「第一个群会话」 | 三级优先级，多群时放弃而非串群 |
 | 合成超时 | 会话级硬编码 60s，超时静默失败 | 每请求独立超时，超时改发文字 |
@@ -251,6 +251,23 @@ plugins/maibot-mimotts-voice/voices/
 
 > `style_instruction` 管整体风格，标签管句内细节，两者不冲突。
 > AI 不填时使用一段中性默认风格（只描述音色与生活化的在场感，不指定情绪），避免与用户单独配置的人格提示词冲突。
+
+### 对外接口（其他插件调用）
+
+插件通过 `@API` 暴露了一个能力，**其他插件**可以直接调用：
+
+```python
+result = await plugin_call("Emilia-awa.maibot-mimotts-voice", "voice_clone_tts", {
+    "text": "要朗读的文本",
+    "stream_id": "目标聊天流",        # 传了就真的会发语音出去
+    "style_instruction": "语气描述",   # 可选
+    "voice_name": "luoxi",            # 可选，不传用默认音色
+})
+```
+
+`voice_name` 传的是 `voices_dir` 里的文件名（不含扩展名），或 `preset` 模式下的预置音色 ID。
+
+注意 `stream_id` 的语义：**传了就会真的把语音发进那个会话**，不只是返回音频数据。不传则只合成、不发送，`result["audio_base64"]` 里是原始音频。这一点对所有调用方都成立 —— 一旦你接上了这个 API，发送目标就不再受本插件「聊天流定位」那套规则约束，调用方给什么流就发什么流。
 
 ## 常见问题
 

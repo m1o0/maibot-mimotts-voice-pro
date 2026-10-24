@@ -230,7 +230,6 @@ class AIVoicePlugin(MaiBotPlugin):
         self.audio_processor: Optional[AudioProcessor] = None
 
     async def on_load(self) -> None:
-        self._ensure_config_exists()
         self.ctx.logger.info("AI Voice Plugin loading...")
         api_key = self.config.voice.mimo_api_key
         if not api_key:
@@ -272,20 +271,6 @@ class AIVoicePlugin(MaiBotPlugin):
         if self.audio_processor is not None:
             chain = self.audio_processor.build_filter_chain()
             self.ctx.logger.info("音频后处理已启用: %s", chain)
-
-    def _ensure_config_exists(self) -> None:
-        """如果用户目录下不存在 config.toml，则从 config.example.toml 复制生成。不会覆盖用户已有配置。"""
-        import shutil
-        plugin_dir = Path(__file__).parent
-        config_path = plugin_dir / "config.toml"
-        example_path = plugin_dir / "config.example.toml"
-        if config_path.exists():
-            return
-        if example_path.exists():
-            shutil.copy2(example_path, config_path)
-            self.ctx.logger.info("Generated config.toml from config.example.toml")
-        else:
-            self.ctx.logger.warning("Neither config.toml nor config.example.toml found")
 
     async def on_unload(self) -> None:
         # 先取消还在跑的后台合成任务，否则插件卸载后协程会挂在已关闭的 session 上。
@@ -351,8 +336,12 @@ class AIVoicePlugin(MaiBotPlugin):
         self.voices.clear()
 
         if not voices_dir.exists():
-            self.ctx.logger.warning("Voices dir not found: %s, creating it", voices_dir)
-            voices_dir.mkdir(parents=True, exist_ok=True)
+            # 不在这里 mkdir：插件只应往 data_dir / runtime_dir 写，
+            # 在源码目录里建空文件夹既会被 .gitignore 吞掉，也让用户以为
+            # 放进去的文件会被同步。直接告诉他该建哪个目录即可。
+            self.ctx.logger.warning(
+                "音色目录不存在: %s，请先创建它并把 .wav/.mp3 参考音频放进去", voices_dir
+            )
             return
 
         self.ctx.logger.info("Voices dir exists: %s, contents: %s", voices_dir, [f.name for f in voices_dir.iterdir()])
@@ -543,7 +532,15 @@ class AIVoicePlugin(MaiBotPlugin):
         preset_id = explicit or self.config.voice.preset_voice or "mimo_default"
         return preset_id, "", "preset"
 
-    @API("voice_clone_tts", description="TTS with specified voice", version="1", public=True)
+    @API(
+        "voice_clone_tts",
+        description=(
+            "合成语音并发送到指定聊天流。传入 stream_id 时会真的把语音发进那个会话，"
+            "不只是返回音频数据；不想发送就留空 stream_id。"
+        ),
+        version="1",
+        public=True,
+    )
     async def voice_clone_tts(self, text: str, style_instruction: str = "", stream_id: str = "", voice_name: str = "") -> dict[str, Any]:
         if not self.tts_service:
             return {"success": False, "error": "TTS service not initialized"}
