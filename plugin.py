@@ -312,10 +312,38 @@ class AIVoicePlugin(MaiBotPlugin):
         await self._load_voices()
         self.ctx.logger.info("Config reloaded: mode=%s, default_voice=%s", self.config.voice.voice_mode, self.default_voice)
 
+    def _resolve_voices_dir(self, plugin_dir: Path) -> Path:
+        """把 `voices_dir` 解析成插件目录下的一个子目录。
+
+        `voices_dir` 直接参与 `plugin_dir / voices_dir` 拼接，如果配成绝对路径
+        或 `../..`，就能读到插件目录之外任意位置的 .wav/.mp3，再 base64 之后
+        发给 MiMo —— 等于给了一条「读什么文件就发什么文件出去」的通路。
+
+        `paths` 约定要求插件只往 `data_dir` / `runtime_dir` 写，同理读取音色
+        也应该限定在插件自己的目录里。越界时回退到默认的 `voices` 并告警，
+        而不是抛错：音色目录配错了，插件其余功能仍应可用。
+        """
+        raw = (self.config.voice.voices_dir or "voices").strip() or "voices"
+        base = plugin_dir.resolve()
+        try:
+            candidate = (base / raw).resolve()
+        except (OSError, ValueError) as exc:
+            self.ctx.logger.warning("voices_dir %r 无法解析（%s），回退到 'voices'", raw, exc)
+            return base / "voices"
+
+        if not candidate.is_relative_to(base):
+            self.ctx.logger.warning(
+                "voices_dir %r 指向插件目录之外（%s），已回退到 'voices'。"
+                "音色目录必须位于插件目录内，否则可能被用来读取任意本地文件",
+                raw,
+                candidate,
+            )
+            return base / "voices"
+        return candidate
+
     async def _load_voices(self) -> None:
-        voices_dir_str = self.config.voice.voices_dir
         plugin_dir = Path(__file__).parent
-        voices_dir = plugin_dir / voices_dir_str
+        voices_dir = self._resolve_voices_dir(plugin_dir)
         self.ctx.logger.info("Loading voices from: %s (plugin_dir=%s)", voices_dir, plugin_dir)
 
         # 重新扫描前先清空：原实现只在「找到音频文件」时才 clear，
@@ -377,21 +405,28 @@ class AIVoicePlugin(MaiBotPlugin):
             except Exception as e:
                 self.ctx.logger.warning("message.get_by_id failed for %s: %s", msg_id, e)
 
-        # 3) 兜底：仅在全局只有一个群会话时使用，避免发错群
+        # 3) 兜底：只有「全局确实只有一个会话」时才敢猜
+        #
+        # 这里必须用 get_all_streams 而不是 get_group_streams：后者只返回群聊，
+        # 在「1 个群 + 若干私聊」的环境里 len==1 也会成立，于是私聊消息会拿到
+        # 那个唯一的群流 —— 正是我们要防的串流。只看全量会话数才能确认没猜错。
         try:
-            streams = await self.ctx.chat.get_group_streams()
-            streams = streams or []
-            if len(streams) == 1:
-                sid = streams[0].get("stream_id", "")
+            all_streams = await self.ctx.chat.get_all_streams() or []
+            if len(all_streams) == 1 and isinstance(all_streams[0], dict):
+                sid = all_streams[0].get("stream_id", "")
                 if sid:
-                    self.ctx.logger.warning("Only one group stream exists, using it as fallback: %s", sid)
+                    self.ctx.logger.warning(
+                        "无法从上下文定位聊天流，但全局只有一个会话，用它兜底: %s", sid
+                    )
                     return str(sid)
-            if len(streams) > 1:
+            if len(all_streams) > 1:
                 self.ctx.logger.error(
-                    "无法确定消息所属聊天流，且有 %d 个群会话；为避免发错群，本次放弃语音发送", len(streams)
+                    "无法确定消息所属聊天流（msg_id 反查失败，全局有 %d 个会话）；"
+                    "为避免发错会话，本次放弃语音发送",
+                    len(all_streams),
                 )
         except Exception as e:
-            self.ctx.logger.warning("chat.get_group_streams failed: %s", e)
+            self.ctx.logger.warning("chat.get_all_streams failed: %s", e)
 
         return ""
 
@@ -649,10 +684,20 @@ class AIVoicePlugin(MaiBotPlugin):
         stream_id = await self._find_stream_id(kwargs, msg_id=msg_id)
         if not stream_id:
             self.ctx.logger.error("Cannot find stream_id for msg_id=%s, kwargs_keys=%s", msg_id, list(kwargs.keys()))
-            return {"success": False, "method": "voice", "error": "Cannot find chat stream"}
+            return {
+                "success": False,
+                "content": "无法确定这条消息属于哪个聊天流，语音没有发送。请改用 reply 工具回复。",
+                "method": "voice",
+                "error": "Cannot find chat stream",
+            }
 
         if not (reply_text or "").strip():
-            return {"success": False, "method": "voice", "error": "Empty reply_text"}
+            return {
+                "success": False,
+                "content": "reply_text 为空，没有可朗读的内容。",
+                "method": "voice",
+                "error": "Empty reply_text",
+            }
 
         self.ctx.logger.info("Using stream_id=%s for voice reply, text_len=%d", stream_id, len(reply_text))
 
@@ -662,7 +707,15 @@ class AIVoicePlugin(MaiBotPlugin):
         task = asyncio.create_task(self._async_voice_reply(reply_text, style_instruction, stream_id, ""))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
-        return {"success": True, "method": "voice", "error": ""}
+        # content 是回给模型的可读文本，模型看到空结果会误判成调用失败，
+        # 然后把同样的内容再用 reply 发一遍 —— 和「语音顶替本次文字回复」
+        # 的设计直接打架。这里明确告诉它语音已经发出去了，不要再补文字。
+        return {
+            "success": True,
+            "content": "语音已开始合成并发送，这条内容已经回复过了，不需要再用 reply 发送文字。",
+            "method": "voice",
+            "error": "",
+        }
 
     # LLM 未填 style_instruction 时的兜底风格。
     # 必须保持中性：各聊天流的专属 prompt 已分别指定风格，这里再带任何

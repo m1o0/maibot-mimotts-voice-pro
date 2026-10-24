@@ -2,7 +2,7 @@
   "manifest_version": 2,
   "id": "m1o0.maibot-mimotts-voice-pro",
   "name": "MiMo TTS Voice Clone (Pro)",
-  "version": "1.9.2",
+  "version": "1.9.3",
   "description": "MiMo TTS Voice Clone Plugin for MaiBot - 语音回复插件，带请求超时、退避重试、并发上限与失败自动退回文字，并支持 ffmpeg 本地音高/语速/响度调整",
   "author": {
     "name": "m1o0",
@@ -28,7 +28,7 @@
     "send.text",
     "send.custom",
     "message.get_by_id",
-    "chat.get_group_streams"
+    "chat.get_all_streams"
   ],
   "i18n": {
     "default_locale": "zh-CN",

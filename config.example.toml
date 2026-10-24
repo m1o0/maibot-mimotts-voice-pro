@@ -8,6 +8,7 @@ mimo_api_key = ""
 api_base_url = "https://token-plan-cn.xiaomimimo.com/v1"
 voice_mode = "clone"                    # "clone"(音色复刻) 或 "preset"(预置音色)
 preset_voice = "mimo_default"           # 仅 preset 模式生效
+# 音色目录，必须是插件目录内的相对路径（写绝对路径或 ../ 会被拒绝并回退）
 voices_dir = "voices"                   # 相对插件目录的参考音频目录
 default_voice = ""                      # clone 模式默认音色（音频文件名，不含扩展名）
 clone_voice = ""                        # clone 模式兜底音色
