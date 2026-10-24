@@ -50,7 +50,7 @@
 
 ```bash
 cd /path/to/MaiBot/plugins/
-git clone https://github.com/m1o0/maibot-mimotts-voice.git
+git clone https://github.com/m1o0/maibot-mimotts-voice-pro.git
 ```
 
 ### 2. 装依赖
