@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -12,6 +13,48 @@ try:
     from .tts_service import MiMoTTSService
 except ImportError:
     from tts_service import MiMoTTSService
+
+try:
+    from .audio_processor import AudioProcessor, build_audio_processor
+except ImportError:
+    from audio_processor import AudioProcessor, build_audio_processor
+
+
+# 语音失败降级发文字时，剥掉只对 TTS 有意义的语气标签，例如
+# （轻笑）（叹气）（温柔）/(sighs)(laughs)。
+#
+# 这里必须用「白名单」而不是「去掉所有括号」：括号在中文里也用来表补充说明，
+# 一刀切会把「宝宝（明天要早起）早点睡」削成「宝宝早点睡」，把「第1名（2026年）」
+# 削成「第1名」—— 内容被静默篡改，比多留一个标签糟糕得多。
+_AUDIO_TAG_WORDS = (
+    "轻笑|笑声|笑|微笑|大笑|苦笑|哈哈笑|"
+    "叹气|叹息|轻声叹|深吸气|深呼吸|吸气|呼气|"
+    "哽咽|哽咽着|哭|哭泣|抽泣|忍哭|"
+    "大声|低声|轻声|柔声|细声|沉声|缓声|"
+    "紧张|放松|平静|温柔|冷淡|冷漠|严肃|生气|愤怒|无奈|疑惑|惊讶|开心|悲伤|难过|兴奋|害羞|疲惫|慵懒|俏皮|活泼|低沉|磁性|沙哑|甜美|"
+    "咳嗽|清嗓|打哈欠|哈欠|低语|耳语|提高音量|大喊|小声|喃喃|停顿|沉默|犹豫|思索|"
+    "东北话|四川话|粤语|日语|英文|唱歌|哼唱|"
+    "sighs?|laughs?|chuckles?|giggles?|coughs?|yawns?|whispers?|softly|loudly|"
+    "excited|angry|sad|happy|nervous|calm|gentle|tired|surprised|confused"
+)
+# 只匹配「整段就是一个语气标签」的情形：标签内除了语气词不带别的字符。
+_AUDIO_TAG_RE = re.compile(
+    rf"[（(]\s*(?:{_AUDIO_TAG_WORDS})\s*[)）]",
+    re.IGNORECASE,
+)
+# 标签删掉后可能在句首/句中/句尾留下多余空格，统一压缩。
+_AUDIO_TAG_SPACE_RE = re.compile(r"[ \t]{2,}")
+
+
+def _strip_audio_tags(text: str) -> str:
+    """剥掉语气标签并清理因此产生的多余空白。
+
+    「宝宝（明天要早起）早点睡」这类正常括号内容**必须原样保留**，
+    所以只按白名单删已知的语气词，不做「删所有括号」的一刀切。
+    """
+    cleaned = _AUDIO_TAG_RE.sub("", text or "")
+    cleaned = _AUDIO_TAG_SPACE_RE.sub(" ", cleaned)
+    return cleaned.strip()
 
 
 class PluginSectionConfig(PluginConfigBase):
@@ -33,11 +76,99 @@ class VoiceSectionConfig(PluginConfigBase):
     voices_dir: str = Field(default="voices", description="音色目录路径（相对于插件目录）")
     default_voice: str = Field(default="", description="默认音色名称（clone模式下为音频文件名）")
     clone_voice: str = Field(default="", description="复刻音色文件名（clone模式下优先使用）")
+    audio_format: str = Field(default="wav", description="合成音频格式：wav / mp3 / pcm16（mp3 体积最小）")
+
+
+class RequestSectionConfig(PluginConfigBase):
+    __ui_label__ = "请求控制"
+    request_timeout: float = Field(default=45.0, description="单次合成总超时（秒），超时后降级发文字")
+    connect_timeout: float = Field(default=10.0, description="建立连接超时（秒）")
+    max_retries: int = Field(default=2, description="429/5xx/网络错误的重试次数（超时不重试）")
+    retry_backoff: float = Field(default=1.5, description="重试退避基数（秒），按指数增长")
+    max_concurrency: int = Field(default=1, description="全局同时进行的合成请求上限。实测并发 2 即触发 429，建议保持 1")
+
+
+class FallbackSectionConfig(PluginConfigBase):
+    __ui_label__ = "失败降级"
+    fallback_to_text: bool = Field(default=True, description="语音失败/超时时，把内容改发文字（否则用户什么都收不到）")
+    empty_text_placeholder: str = Field(
+        default="（想说点什么，但声音没发出来）",
+        description="降级时若正文被音频标签清空，用这句兜底（留空则不发）",
+    )
+    strip_audio_tags: bool = Field(default=True, description="降级发文字时剥掉（轻笑）这类只对 TTS 有意义的标签")
+    skip_when_busy: bool = Field(default=True, description="同一聊天流已有语音在合成时，本次直接改发文字")
+
+
+class AudioSectionConfig(PluginConfigBase):
+    """合成后的本地音频处理。
+
+    MiMo 接口只负责把文字念出来，不提供音高/语速/响度这些「调音」参数
+    （实测 audio.speed / audio.emotion / 顶层 speed 都被服务端静默忽略，
+    见 CHANGELOG）。所以这里用 ffmpeg 在本地做后处理。
+    全部默认关闭，不配置就不会调用 ffmpeg。
+    """
+
+    __ui_label__ = "音频处理"
+
+    ffmpeg_path: str = Field(
+        default="ffmpeg",
+        description="ffmpeg 可执行文件路径。留空或写 ffmpeg 表示从 PATH 里找",
+    )
+
+    # ---- 音高 ----
+    pitch_semitones: float = Field(
+        default=0.0,
+        description="音高调整（半音）。负数降调更沉稳，正数升调更幼。"
+        "-1≈降7%，-2≈降11%，-3≈降16%。0 表示不处理",
+    )
+    preserve_formant: bool = Field(
+        default=True,
+        description="降调时保留共振峰（音色更自然，不易变成「慢放感」）",
+    )
+
+    # ---- 语速 ----
+    speed: float = Field(
+        default=1.0,
+        description="语速倍率。0.9 慢一点更温柔，1.1 快一点更活泼。范围 0.5~2.0",
+    )
+
+    # ---- 响度 ----
+    loudness_normalize: bool = Field(
+        default=False,
+        description="响度标准化（把音量拉到统一水平，避免有的句子小声有的刺耳）",
+    )
+    loudness_target: float = Field(
+        default=-16.0,
+        description="响度标准化目标（LUFS）。-16 适合语音，-14 更接近流媒体平台",
+    )
+
+    # ---- 音色微调 ----
+    highpass_hz: int = Field(
+        default=0,
+        description="高通滤波截止频率（Hz），去掉低频轰隆声。0 表示关闭，常用 80",
+    )
+    volume_db: float = Field(
+        default=0.0,
+        description="额外音量增益（dB），正数变大",
+    )
+
+    # ---- 首尾 ----
+    fade_ms: int = Field(
+        default=0,
+        description="首尾淡入淡出时长（毫秒），能消除合成音频开头的爆音。0 表示关闭，常用 30~50",
+    )
+    trim_silence: bool = Field(
+        default=False,
+        description="去掉首尾多余静音（部分合成结果开头有半秒空白）",
+    )
 
 
 class VoicePluginConfig(PluginConfigBase):
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
     voice: VoiceSectionConfig = Field(default_factory=VoiceSectionConfig)
+    request: RequestSectionConfig = Field(default_factory=RequestSectionConfig)
+    fallback: FallbackSectionConfig = Field(default_factory=FallbackSectionConfig)
+    audio: AudioSectionConfig = Field(default_factory=AudioSectionConfig)
 
 
 class AIVoicePlugin(MaiBotPlugin):
@@ -48,6 +179,16 @@ class AIVoicePlugin(MaiBotPlugin):
         self.tts_service: Optional[MiMoTTSService] = None
         self.voices: dict[str, str] = {}
         self.default_voice: str = ""
+        # 记录每个聊天流是否有语音正在合成。MiMo 接口有速率限制（实测密集请求
+        # 返回 429 Too many requests），且单次合成可能长达数十秒；若同一流堆叠
+        # 多个语音任务，会互相拖慢并触发限流。已有语音在跑时，新语音直接降级。
+        self._voice_inflight: set[str] = set()
+        # 持有后台任务的强引用。asyncio 只对任务做弱引用，若不在集合里留一份，
+        # 任务可能在执行途中被 GC 回收（官方文档明确提示的坑）。
+        self._background_tasks: set[asyncio.Task] = set()
+        # 本地音频后处理（降调/语速/响度等）。全部默认关闭时为 None，
+        # 不会引入任何额外开销，也不会去探测 ffmpeg。
+        self.audio_processor: Optional[AudioProcessor] = None
 
     async def on_load(self) -> None:
         self._ensure_config_exists()
@@ -55,11 +196,33 @@ class AIVoicePlugin(MaiBotPlugin):
         api_key = self.config.voice.mimo_api_key
         if not api_key:
             self.ctx.logger.warning("MiMo API Key not configured")
-        self.tts_service = MiMoTTSService(api_key=api_key, api_base_url=self.config.voice.api_base_url, logger=self.ctx.logger)
+        self._rebuild_tts_service()
         self.default_voice = self.config.voice.default_voice or self.config.voice.clone_voice
         await self._load_voices()
         self.ctx.logger.info("AI Voice Plugin loaded: mode=%s, default_voice=%s, voices=%s",
             self.config.voice.voice_mode, self.default_voice, list(self.voices.keys()))
+
+    def _rebuild_tts_service(self) -> None:
+        """按当前配置重建 TTS 服务实例（热重载时同样走这里）。"""
+        request_cfg = self.config.request
+        self.tts_service = MiMoTTSService(
+            api_key=self.config.voice.mimo_api_key,
+            api_base_url=self.config.voice.api_base_url,
+            logger=self.ctx.logger,
+            request_timeout=request_cfg.request_timeout,
+            connect_timeout=request_cfg.connect_timeout,
+            max_retries=request_cfg.max_retries,
+            retry_backoff=request_cfg.retry_backoff,
+            max_concurrency=request_cfg.max_concurrency,
+        )
+        self._rebuild_audio_processor()
+
+    def _rebuild_audio_processor(self) -> None:
+        """按当前配置重建音频处理器；没有任何处理项时为 None。"""
+        self.audio_processor = build_audio_processor(self.config, logger=self.ctx.logger)
+        if self.audio_processor is not None:
+            chain = self.audio_processor.build_filter_chain()
+            self.ctx.logger.info("音频后处理已启用: %s", chain)
 
     def _ensure_config_exists(self) -> None:
         """如果用户目录下不存在 config.toml，则从 config.example.toml 复制生成。不会覆盖用户已有配置。"""
@@ -76,26 +239,39 @@ class AIVoicePlugin(MaiBotPlugin):
             self.ctx.logger.warning("Neither config.toml nor config.example.toml found")
 
     async def on_unload(self) -> None:
+        # 先取消还在跑的后台合成任务，否则插件卸载后协程会挂在已关闭的 session 上。
+        for task in list(self._background_tasks):
+            task.cancel()
+        self._background_tasks.clear()
+        self._voice_inflight.clear()
         if self.tts_service:
             await self.tts_service.close()
             self.tts_service = None
         self.voices.clear()
 
     async def on_config_update(self, scope: str, config_data: dict[str, object], version: str) -> None:
-        if scope == CONFIG_RELOAD_SCOPE_SELF:
-            self.ctx.logger.info("Plugin config updated: version=%s", version)
-            if self.tts_service and self.config.voice.mimo_api_key:
-                self.tts_service.update_api_key(self.config.voice.mimo_api_key)
-                self.tts_service.update_api_base_url(self.config.voice.api_base_url)
-            self.default_voice = self.config.voice.default_voice or self.config.voice.clone_voice
-            await self._load_voices()
-            self.ctx.logger.info("Config reloaded: mode=%s, default_voice=%s", self.config.voice.voice_mode, self.default_voice)
+        if scope != CONFIG_RELOAD_SCOPE_SELF:
+            return
+        self.ctx.logger.info("Plugin config updated: version=%s", version)
+        # 重建服务而不是增量 update：原实现只在「新 key 非空」时才更新，
+        # 导致把 key 清空后旧 key 仍留在内存里继续计费，且 base_url 同理会残留。
+        old_service = self.tts_service
+        self._rebuild_tts_service()
+        if old_service is not None:
+            await old_service.close()
+        self.default_voice = self.config.voice.default_voice or self.config.voice.clone_voice
+        await self._load_voices()
+        self.ctx.logger.info("Config reloaded: mode=%s, default_voice=%s", self.config.voice.voice_mode, self.default_voice)
 
     async def _load_voices(self) -> None:
         voices_dir_str = self.config.voice.voices_dir
         plugin_dir = Path(__file__).parent
         voices_dir = plugin_dir / voices_dir_str
         self.ctx.logger.info("Loading voices from: %s (plugin_dir=%s)", voices_dir, plugin_dir)
+
+        # 重新扫描前先清空：原实现只在「找到音频文件」时才 clear，
+        # 把 voices 目录里的文件全删掉后热重载，旧音色仍会被继续引用。
+        self.voices.clear()
 
         if not voices_dir.exists():
             self.ctx.logger.warning("Voices dir not found: %s, creating it", voices_dir)
@@ -104,16 +280,14 @@ class AIVoicePlugin(MaiBotPlugin):
 
         self.ctx.logger.info("Voices dir exists: %s, contents: %s", voices_dir, [f.name for f in voices_dir.iterdir()])
 
-        audio_files = list(voices_dir.glob("*.wav")) + list(voices_dir.glob("*.mp3"))
+        audio_files = sorted(list(voices_dir.glob("*.wav")) + list(voices_dir.glob("*.mp3")))
         if not audio_files:
             self.ctx.logger.warning("No audio files found in: %s", voices_dir)
             return
 
-        self.voices.clear()
         for audio_file in audio_files:
             voice_name = audio_file.stem
             file_size = audio_file.stat().st_size
-            # Detect MIME type from extension
             suffix = audio_file.suffix.lower()
             mime_type = "audio/wav" if suffix == ".wav" else "audio/mpeg"
             with open(audio_file, "rb") as f:
@@ -129,59 +303,123 @@ class AIVoicePlugin(MaiBotPlugin):
 
         self.ctx.logger.info("Voice loading complete, total %d voices, names=%s", len(self.voices), list(self.voices.keys()))
 
-    async def _find_stream_id(self, kwargs: dict) -> str:
-        """Find stream_id from various sources."""
-        # Method 1: from kwargs (system may pass it)
-        sid = kwargs.get("stream_id", "")
+    async def _find_stream_id(self, kwargs: dict, msg_id: str = "") -> str:
+        """定位本次回复该发往哪个聊天流。
+
+        优先级：宿主动态注入的上下文 → 用 msg_id 反查消息 → 单群兜底。
+
+        原实现的第一顺位是「拿不到就取第一个群流」，那在多群环境下会把私聊的
+        语音发进群里，是很危险的串流 bug。现在改为先按 msg_id 反查真实会话，
+        只有确认「全局只有一个群会话」时才允许兜底，其余情况直接失败并降级文字。
+        """
+        # 1) 宿主在工具调用时注入的上下文（绝大多数情况走这条）
+        sid = kwargs.get("stream_id") or kwargs.get("chat_id") or kwargs.get("session_id")
         if sid:
-            self.ctx.logger.info("Got stream_id from kwargs: %s", sid)
             return str(sid)
 
-        # Method 2: from kwargs message
-        msg = kwargs.get("message", {})
-        if isinstance(msg, dict):
-            sid = msg.get("stream_id", "")
-            if sid:
-                self.ctx.logger.info("Got stream_id from message: %s", sid)
-                return str(sid)
+        # 2) 用 msg_id 反查消息归属的会话
+        if msg_id:
+            try:
+                message = await self.ctx.message.get_by_id(str(msg_id), include_binary_data=False)
+                resloved = self._stream_id_from_message(message)
+                if resloved:
+                    self.ctx.logger.info("Resolved stream_id from message %s: %s", msg_id, resloved)
+                    return resloved
+            except Exception as e:
+                self.ctx.logger.warning("message.get_by_id failed for %s: %s", msg_id, e)
 
-        # Method 3: try to find group stream
+        # 3) 兜底：仅在全局只有一个群会话时使用，避免发错群
         try:
             streams = await self.ctx.chat.get_group_streams()
-            if streams:
+            streams = streams or []
+            if len(streams) == 1:
                 sid = streams[0].get("stream_id", "")
-                self.ctx.logger.info("Using first group stream: %s", sid)
-                return str(sid)
+                if sid:
+                    self.ctx.logger.warning("Only one group stream exists, using it as fallback: %s", sid)
+                    return str(sid)
+            if len(streams) > 1:
+                self.ctx.logger.error(
+                    "无法确定消息所属聊天流，且有 %d 个群会话；为避免发错群，本次放弃语音发送", len(streams)
+                )
         except Exception as e:
             self.ctx.logger.warning("chat.get_group_streams failed: %s", e)
 
         return ""
 
+    @staticmethod
+    def _stream_id_from_message(message: Any) -> str:
+        """从 message.get_by_id 的返回值里挖出 stream_id / session_id。"""
+        if not isinstance(message, dict):
+            return ""
+        for key in ("session_id", "stream_id", "chat_id"):
+            value = message.get(key)
+            if value:
+                return str(value)
+        message_info = message.get("message_info")
+        if isinstance(message_info, dict):
+            for key in ("stream_id", "session_id", "chat_id"):
+                value = message_info.get(key)
+                if value:
+                    return str(value)
+        return ""
+
+    async def _apply_audio_processing(self, audio_b64: str, audio_format: str) -> str:
+        """对合成结果做本地后处理；任何失败都返回原始 base64。"""
+        # 没有配置任何处理项时 build_audio_processor 返回 None，
+        # 这里再兜一层，避免调用方漏判时炸掉整条语音。
+        processor = self.audio_processor
+        if processor is None or not audio_b64:
+            return audio_b64
+
+        try:
+            raw = base64.b64decode(audio_b64, validate=False)
+        except Exception as exc:  # noqa: BLE001
+            self.ctx.logger.warning("音频 base64 解码失败，跳过后处理: %r", exc)
+            return audio_b64
+
+        if not raw:
+            return audio_b64
+
+        processed = await processor.process(raw, audio_format)
+        if processed is raw or processed == raw:
+            return audio_b64
+
+        try:
+            return base64.b64encode(processed).decode("ascii")
+        except Exception as exc:  # noqa: BLE001
+            self.ctx.logger.warning("音频 base64 重新编码失败，使用原始音频: %r", exc)
+            return audio_b64
+
     async def _send_voice(self, audio_b64: str, stream_id: str) -> bool:
         """Send voice message using base64 format.
-        注意: 调用后 audio_b64 会被消费，不再可用。
+
+        宿主 send.custom 对 "voice" 类型会把 content 当作纯 base64 交给
+        VoiceComponent（适配器再走 binary_data_base64），而 "record" 类型只会
+        落到 DictComponent 原样透传，NapCat 静默失败却不报错。因此先走 voice。
         """
         self.ctx.logger.info("Sending voice to stream=%s, b64_len=%d", stream_id, len(audio_b64))
 
-        b64_url = f"base64://{audio_b64}"
-        # 原始引用可以释放（如果调用方已 del 则无额外效果，但作为安全措施）
-        audio_b64 = ""
-
-        # Method 1: record type with base64 (NapCat standard for voice)
+        # Method 1: voice type with pure base64 -> VoiceComponent(binary_data)
         try:
-            await self.ctx.send.custom("record", {"file": b64_url}, stream_id)
-            self.ctx.logger.info("Sent via record+base64")
-            return True
+            result = await self.ctx.send.custom("voice", audio_b64, stream_id)
+            if result is False:
+                self.ctx.logger.warning("voice+pure-base64 returned False")
+            else:
+                self.ctx.logger.info("Sent via voice+pure-base64")
+                return True
+        except Exception as e:
+            self.ctx.logger.warning("voice+pure-base64 failed: %s", e)
+
+        # Method 2: record type with base64 url (NapCat fallback)
+        try:
+            result = await self.ctx.send.custom("record", {"file": f"base64://{audio_b64}"}, stream_id)
+            if result is False:
+                self.ctx.logger.warning("record+base64 returned False")
+            else:
+                self.ctx.logger.info("Sent via record+base64")
+                return True
         except Exception as e:
             self.ctx.logger.warning("record+base64 failed: %s", e)
-
-        # Method 2: voice type with base64
-        try:
-            await self.ctx.send.custom("voice", {"file": b64_url}, stream_id)
-            self.ctx.logger.info("Sent via voice+base64")
-            return True
-        except Exception as e:
-            self.ctx.logger.warning("voice+base64 failed: %s", e)
 
         self.ctx.logger.error("All voice send methods failed")
         return False
@@ -191,12 +429,11 @@ class AIVoicePlugin(MaiBotPlugin):
         mode: 'clone' 使用音色复刻, 'preset' 使用预置音色。
         """
         voice_mode = self.config.voice.voice_mode
-
-        # 确定要使用的音色 key
-        voice_key = voice_name if voice_name and voice_name != "default" else self.default_voice
+        explicit = voice_name if voice_name and voice_name != "default" else ""
 
         # clone 模式：从本地音频文件中查找参考音频
         if voice_mode == "clone":
+            voice_key = explicit or self.default_voice
             if voice_key and voice_key in self.voices:
                 return voice_key, self.voices[voice_key], "clone"
 
@@ -216,8 +453,10 @@ class AIVoicePlugin(MaiBotPlugin):
             self.ctx.logger.error("No voices loaded! Please put .wav/.mp3 files in the voices/ directory.")
             return "", "", ""
 
-        # preset 模式
-        preset_id = voice_key or self.config.voice.preset_voice or "mimo_default"
+        # preset 模式：只认显式传入的音色名或 preset_voice。
+        # 不能回落到 default_voice —— 那是 clone 模式下的音频文件名（如 "luoxi"），
+        # 当成预置音色 ID 发出去会被上游拒绝。
+        preset_id = explicit or self.config.voice.preset_voice or "mimo_default"
         return preset_id, "", "preset"
 
     @API("voice_clone_tts", description="TTS with specified voice", version="1", public=True)
@@ -232,17 +471,27 @@ class AIVoicePlugin(MaiBotPlugin):
         if not voice_key:
             return {"success": False, "error": "No voice configured. Check voice config."}
 
-        self.ctx.logger.info("TTS request: mode=%s, voice_key=%s, text_len=%d, style_len=%d",
-            mode, voice_key, len(text), len(style_instruction))
+        audio_format = (self.config.voice.audio_format or "wav").strip().lower()
+        if audio_format not in MiMoTTSService.SUPPORTED_FORMATS:
+            self.ctx.logger.warning(
+                "不支持的 audio_format=%r，回退到 wav（支持：%s）",
+                audio_format, ", ".join(MiMoTTSService.SUPPORTED_FORMATS),
+            )
+            audio_format = "wav"
+
+        self.ctx.logger.info("TTS request: mode=%s, voice_key=%s, text_len=%d, style_len=%d, format=%s",
+            mode, voice_key, len(text), len(style_instruction), audio_format)
 
         try:
             if mode == "clone":
                 result = await self.tts_service.synthesize_with_voice_clone(
-                    text=text, reference_audio_base64=ref_audio, style_instruction=style_instruction,
+                    text=text, reference_audio_base64=ref_audio,
+                    style_instruction=style_instruction, audio_format=audio_format,
                 )
             else:
                 result = await self.tts_service.synthesize_with_preset(
-                    text=text, voice_id=voice_key, style_instruction=style_instruction,
+                    text=text, voice_id=voice_key,
+                    style_instruction=style_instruction, audio_format=audio_format,
                 )
 
             # 释放参考音频引用
@@ -262,8 +511,17 @@ class AIVoicePlugin(MaiBotPlugin):
                 # 立即从 result 中移除大字段，避免双重内存占用
                 result.pop("audio_base64", None)
 
-                await self._send_voice(audio_b64, stream_id)
+                # 本地音频后处理（降调/语速/响度等）。失败会原样返回原始音频。
+                if self.audio_processor is not None:
+                    audio_b64 = await self._apply_audio_processing(audio_b64, audio_format)
+
+                # 把发送结果也纳入 success，否则「合成成功但发不出去」
+                # 会被当成成功，用户收不到任何东西。
+                sent = await self._send_voice(audio_b64, stream_id)
                 audio_b64 = ""
+                if not sent:
+                    result["success"] = False
+                    result["error"] = "voice send failed"
             elif audio_b64:
                 # 不需要发送时也清理
                 result.pop("audio_base64", None)
@@ -275,9 +533,26 @@ class AIVoicePlugin(MaiBotPlugin):
 
     @Tool(
         "send_voice_reply",
-        brief_description="使用语音回复用户，可选传入风格指令控制语气情绪",
+        brief_description=(
+            "用语音说话给用户听，是和打字并列的常规回复方式，不必等用户先开口要求。"
+            "语音要花几秒到几十秒合成，所以它适合短而贴心的话，不适合需要阅读的长内容。"
+            "优先用语音：撒娇、关心对方作息身体、表达想念或喜欢、调情、吐槽接梗、"
+            "对方情绪低落需要安慰、深夜安静聊天、对方刚发来语音、对方明确要求语音。"
+            "改用文字：超过两三句的长内容、需要列条目或仔细阅读的信息、要讲清楚的原理解释、"
+            "上一条刚用过语音、或只是「嗯」「好呀」这类一句话就完的应答。"
+            "私聊里可以多说，大约一半回复用语音；群聊里以打字为主，只在有人点名要你说话、"
+            "气氛特别热、被逗笑、安慰难过的人或深夜安静时偶尔用一次。"
+            "语音会替代本次文字回复，不要对同一条内容既发文字又发语音。"
+            "可选 style_instruction 控制语气情绪。"
+        ),
         detailed_description=(
-            "使用语音进行回复。当用户要求语音、用户发送了语音消息、或你认为当前场景适合语音回复时调用。\n"
+            "使用语音进行回复。这是一种和打字并列的常规回复方式，不必等用户先开口要求。\n"
+            "遇到以下情形应当优先用语音而不是文字：撒娇、关心对方的作息和身体、表达想念或喜欢、"
+            "撩拨调情、对方情绪低落需要安慰、深夜安静地聊天、对方刚发来语音消息、对方明确要求语音。\n"
+            "换用文字更合适的情形：超过两三句的长内容、需要对方仔细阅读的信息、要讲清原理解释的内容、"
+            "上一条刚用过语音、或者只是「嗯」「好呀」这类一句话就结束的应答。\n"
+            "私人一对一的聊天里大概一半用语音，群里则相对克制，只在气氛合适时偶尔用一次。\n"
+            "注意：语音会直接替代这次文字回复，不要对同一条内容既发文字又发语音。\n"
             "必填参数：reply_text（回复文本）、msg_id（当前消息ID）。\n"
             "可选参数：style_instruction（语音风格指令），不传则使用默认音色自然朗读，需要更生动的表达时可填写。\n\n"
             "【风格控制】可通过 style_instruction 参数精细控制语音演绎效果，"
@@ -301,6 +576,7 @@ class AIVoicePlugin(MaiBotPlugin):
             "提示：style_instruction（整体风格）+ reply_text 中的音频标签（句内细节）可同时使用，两者不冲突。"
         ),
         activation_type=ActivationType.ALWAYS,
+        visibility="visible",
         parameters=[
             ToolParameterInfo(name="reply_text", param_type=ToolParamType.STRING, description="回复文本。可在文本中插入音频标签控制句内语气细节，如（叹气）（轻笑）（温柔）（紧张）等。", required=True),
             ToolParameterInfo(name="msg_id", param_type=ToolParamType.STRING, description="当前消息ID", required=True),
@@ -321,24 +597,92 @@ class AIVoicePlugin(MaiBotPlugin):
     )
     async def send_voice_reply(self, reply_text: str, msg_id: str = "", style_instruction: str = "", **kwargs: Any) -> dict[str, Any]:
         # Find the correct stream_id
-        stream_id = await self._find_stream_id(kwargs)
+        stream_id = await self._find_stream_id(kwargs, msg_id=msg_id)
         if not stream_id:
             self.ctx.logger.error("Cannot find stream_id for msg_id=%s, kwargs_keys=%s", msg_id, list(kwargs.keys()))
             return {"success": False, "method": "voice", "error": "Cannot find chat stream"}
 
+        if not (reply_text or "").strip():
+            return {"success": False, "method": "voice", "error": "Empty reply_text"}
+
         self.ctx.logger.info("Using stream_id=%s for voice reply, text_len=%d", stream_id, len(reply_text))
 
-        # Always use the configured default voice
-        asyncio.create_task(self._async_voice_reply(reply_text, style_instruction, stream_id, ""))
+        # Always use the configured default voice.
+        # 必须把 task 存进集合持有强引用：asyncio 只保留弱引用，不持有的话
+        # 协程可能在合成途中被 GC 掉，表现为「日志停在 TTS request 就没有下文」。
+        task = asyncio.create_task(self._async_voice_reply(reply_text, style_instruction, stream_id, ""))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
         return {"success": True, "method": "voice", "error": ""}
 
+    # LLM 未填 style_instruction 时的兜底风格。
+    # 必须保持中性：各聊天流的专属 prompt 已分别指定风格，这里再带任何
+    # 情绪倾向（活泼/软糯/低沉等）都会在漏填时和对应人设冲突。
+    # 只说“声音本身”和“在场感”，不指定语气、情绪、语速。
+    DEFAULT_VOICE_STYLE = (
+        "一位年轻女性的声音，自然、生活化，像平时和人面对面聊天。"
+        "吐字清楚，气息放松；不带情绪倾向，不表演，不播音腔，不过度卖萌。"
+    )
+
     async def _async_voice_reply(self, text: str, style_instruction: str, stream_id: str, voice_name: str) -> None:
-        """Send voice reply asynchronously."""
+        """Send voice reply asynchronously.
+
+        语音合成失败/超时时降级发文字。因为 send_voice_reply 会顶替本次文字回复，
+        若不降级，用户会什么都收不到（实测出现过 TTS 卡 163s、以及上游 429/超时
+        导致整条回复消失）。
+        """
+        fallback_cfg = self.config.fallback
+        if fallback_cfg.skip_when_busy and stream_id in self._voice_inflight:
+            self.ctx.logger.warning("语音仍在合成中，本次直接改发文字（避免堆叠与限流）")
+            await self._fallback_to_text(text, stream_id)
+            return
+        self._voice_inflight.add(stream_id)
         try:
-            result = await self.voice_clone_tts(text=text, style_instruction=style_instruction, stream_id=stream_id, voice_name=voice_name)
-            self.ctx.logger.info("Async voice reply result: %s", result.get("success"))
+            effective_style = (style_instruction or "").strip() or self.DEFAULT_VOICE_STYLE
+            if not (style_instruction or "").strip():
+                self.ctx.logger.info("No style_instruction provided, using neutral default voice style")
+            result = await self.voice_clone_tts(text=text, style_instruction=effective_style, stream_id=stream_id, voice_name=voice_name)
+            success = bool(result.get("success"))
+            self.ctx.logger.info("Async voice reply result: %s", success)
+            if not success:
+                reason = str(result.get("error", "") or "unknown")
+                self.ctx.logger.warning("Voice reply failed (%s), falling back to text", reason)
+                await self._fallback_to_text(text, stream_id)
+        except asyncio.CancelledError:
+            # 插件卸载时会 cancel 掉后台任务，这里不该再发消息，直接向上抛。
+            self.ctx.logger.info("语音任务被取消 stream=%s", stream_id)
+            raise
         except Exception as e:
             self.ctx.logger.error("Async voice reply failed: %s", e)
+            await self._fallback_to_text(text, stream_id)
+        finally:
+            self._voice_inflight.discard(stream_id)
+
+    async def _fallback_to_text(self, text: str, stream_id: str) -> None:
+        """语音失败时把回复内容改发文字，避免本次回复彻底丢失。"""
+        fallback_cfg = self.config.fallback
+        if not fallback_cfg.fallback_to_text:
+            self.ctx.logger.warning("已禁用文字降级，本次回复将丢失 text_len=%d", len(text or ""))
+            return
+
+        # 去掉只对 TTS 有意义的音频标签，如（轻笑）（叹气）(laughs)，
+        # 但保留正常括号内容（「宝宝（明天要早起）早点睡」不能变成「宝宝早点睡」）。
+        plain = (text or "").strip()
+        if fallback_cfg.strip_audio_tags:
+            plain = _strip_audio_tags(plain)
+
+        if not plain:
+            placeholder = (fallback_cfg.empty_text_placeholder or "").strip()
+            if not placeholder:
+                self.ctx.logger.warning("降级文字为空且未配置兜底文案，本次回复将丢失")
+                return
+            plain = placeholder
+
+        try:
+            ok = await self.ctx.send.text(plain, stream_id)
+            self.ctx.logger.info("Fallback text sent=%s len=%d", ok, len(plain))
+        except Exception as e:
+            self.ctx.logger.error("Fallback text send failed: %s", e)
 
 
 def create_plugin() -> AIVoicePlugin:

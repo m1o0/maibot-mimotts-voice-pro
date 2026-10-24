@@ -1,0 +1,29 @@
+# 字节码与缓存
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 用户配置与环境密钥（务必不要提交，里面含 API Key）
+config.toml
+
+# 音色复刻音频：体积大且属于个人素材，不入库
+# 注意必须写 voices/* 而不是 voices/ —— 被排除的目录 git 不会进去遍历，
+# 那样 !voices/.gitkeep 这条例外永远不会生效。
+voices/*
+!voices/.gitkeep
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 编辑器与系统文件
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 本地调试产物
+*.log
+*.bak
+*.bak-*

@@ -3,10 +3,67 @@ enabled = true
 config_version = "1.0.0"
 
 [voice]
+# MiMo API Key。按量计费请把 api_base_url 改为 https://api.xiaomimimo.com/v1
 mimo_api_key = ""
 api_base_url = "https://token-plan-cn.xiaomimimo.com/v1"
-voice_mode = "clone"
-preset_voice = "mimo_default"
-voices_dir = "voices"
-default_voice = ""
-clone_voice = ""
+voice_mode = "clone"                    # "clone"(音色复刻) 或 "preset"(预置音色)
+preset_voice = "mimo_default"           # 仅 preset 模式生效
+voices_dir = "voices"                   # 相对插件目录的参考音频目录
+default_voice = ""                      # clone 模式默认音色（音频文件名，不含扩展名）
+clone_voice = ""                        # clone 模式兜底音色
+audio_format = "mp3"                    # wav / mp3 / pcm / pcm16，mp3 体积约 wav 的 1/6
+
+[request]
+# 单次合成总超时（秒）。MiMo 实测抖动 5s~200s+，超时后降级发文字。
+# 若开启了 [audio] 的慢速处理（如 speed < 1），语音本身会变长，可适当调大。
+request_timeout = 45.0
+connect_timeout = 10.0
+# 仅对 429/5xx/网络错误重试；超时不重试（再等只会让用户等更久）。
+max_retries = 2
+retry_backoff = 1.5
+# 全局同时进行的合成请求上限。实测并发 2 即触发 429，保持 1 最稳。
+max_concurrency = 1
+
+[fallback]
+# 语音失败/超时时把内容改发文字。关闭后用户会收不到任何内容。
+fallback_to_text = true
+empty_text_placeholder = "（想说点什么，但声音没发出来）"
+strip_audio_tags = true
+# 同一聊天流已有语音在合成时，本次直接改发文字，避免堆叠与限流。
+skip_when_busy = true
+
+[audio]
+# 合成后的本地音频处理，需要 ffmpeg（https://ffmpeg.org）。
+# 全部保持默认值 = 不做任何处理，也不会调用 ffmpeg。
+# 配置了任意一项后，每次语音会多花 0.2~0.5 秒做本地处理。
+ffmpeg_path = "ffmpeg"                  # ffmpeg 命令名（走 PATH）或绝对路径
+
+# ---- 音高：最常用的调整 ----
+# 半音单位。降调让声音更沉稳，升调更幼。
+# -1 ≈ 降 7%（明显变柔）  -2 ≈ 降 11%  -3 ≈ 降 16%（偏成熟）
+#  1 ≈ 升 6%（更幼）        0 = 不处理
+pitch_semitones = 0.0
+# 降调时保留共振峰，音色更自然；关掉会有"慢放"般的失真感。
+preserve_formant = true
+
+# ---- 语速 ----
+# 0.9 慢一点更温柔，1.1 快一点更活泼。范围 0.5~2.0（超出会自动串联多级）。
+speed = 1.0
+
+# ---- 响度 ----
+# 把音量拉到统一水平，避免有的句子小声、有的刺耳。
+loudness_normalize = false
+# 目标响度（LUFS）。-16 适合语音，-14 更接近流媒体平台。
+loudness_target = -16.0
+
+# ---- 音色微调 ----
+# 高通滤波，去掉低频轰隆声。0 = 关闭，常用 80。
+highpass_hz = 0
+# 额外增益（dB），正数变大。0 = 不调整。
+volume_db = 0.0
+
+# ---- 首尾处理 ----
+# 首尾淡入淡出（毫秒），能消除合成音频开头的爆音。0 = 关闭，常用 30~50。
+fade_ms = 0
+# 去掉首尾多余静音（部分合成结果开头有半秒空白）。
+trim_silence = false
