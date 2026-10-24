@@ -1,77 +1,137 @@
-# MiMo TTS Voice Plugin for MaiBot
+<div align="center">
 
-基于小米 MiMo-V2.5-TTS 的 AI 语音服务插件，为 MaiBot 提供智能语音回复功能。支持**预置音色**和**音色复刻**两种模式。
+# maibot-mimotts-voice
 
-## 功能特性(好用的话请点个star⭐~)
+**让 MaiBot 里的 AI 角色真的开口说话**
 
-- 🎤 **预置音色**：内置 9 种精品音色（中文/英文，男声/女声），开箱即用
-- 🎭 **音色复刻**：通过音频样本精准复刻任意音色，放入 `voices/` 目录即可
-- 🤖 **AI 工具链暴露**：`send_voice_reply` 工具暴露在 AI 工具链中（`activation_type=ALWAYS`，`visibility=visible`），AI 可自主决定何时使用语音回复
-- 🎨 **AI 智能风格控制**：风格指令由 AI 根据角色人设和对话情境自行决定，无需用户手动配置
-- 🎬 **导演模式**：支持从角色、场景、指导三个维度全方位刻画语音表演，AI 自动判断何时需要深度演绎
-- ⚡ **异步发送**：语音合成和发送异步执行，不阻塞 AI 主循环
-- 🛡️ **失败降级**：合成失败/超时时自动改发文字，不会让用户干等或收不到回复
-- 🔁 **自动重试**：429、5xx、网络抖动按指数退避重试；超时快速放弃（不重试）
-- 🚦 **并发保护**：全局并发上限 + 同流去重，避免触发上游限流
-- 🎚️ **音色可调**：音高、语速、响度、淡入淡出、去静音等本地 ffmpeg 后处理（可选，默认关闭）
-- 🔧 **自动配置初始化**：首次启动时自动从 `config.example.toml` 生成 `config.toml`，不覆盖用户已有配置
-- 🔄 **热重载**：修改 `config.toml` 后自动重建服务，密钥/音色/超时/调音参数即时生效
+基于小米 MiMo-V2.5-TTS 的语音插件，把文字回复变成有情绪、有音色、有停顿的语音。
 
-## 安装
+![version](https://img.shields.io/badge/version-1.9.0-blue)
+![python](https://img.shields.io/badge/python-3.9%2B-3776AB)
+![license](https://img.shields.io/badge/license-MIT-green)
+![platform](https://img.shields.io/badge/MaiBot-%E2%89%A51.0.0-orange)
 
-### 1. 复制插件到 MaiBot
+[快速开始](#快速开始) · [功能](#这个-fork-做了什么) · [配置](#配置说明) · [常见问题](#常见问题) · [与上游的关系](#与上游的关系)
+
+</div>
+
+---
+
+## 这是什么
+
+一个 MaiBot 插件：给 AI 注册一个 `send_voice_reply` 工具，它就能在聊天里用语音回你——音色可以是预置的，也可以是你自己录的 30 秒样本复刻出来的。
+
+它解决的核心问题是**语音合成的不确定性**。MiMo 接口的延迟在 4.5 秒到 160 秒之间随机波动（实测同一句话，与文本长度无关），上游并发就会 `429`，超时后接口还会返回空音频。如果不处理，用户看到的就是「AI 回了一半突然没声」或者「消息发出去了但根本没收到」。
+
+这个插件把这些问题都收在内部：超时降级、并发限流、失败重试、发不出去就改发文字。**对使用者来说，语音要么正常出现，要么自然退回文字，不会有第三种状态。**
+
+## 这个 fork 做了什么
+
+上游版本停在 v1.6.0（2026-05），这个 fork 在其基础上重做了错误处理链路，并新增本地音频后处理。
+
+| | 上游 v1.6.0 | 本 fork v1.9.0 |
+|---|---|---|
+| 聊天流定位 | 拿不到时取「第一个群会话」 | 三级优先级，多群时放弃而非串群 |
+| 合成超时 | 会话级硬编码 60s，超时静默失败 | 每请求独立超时，超时改发文字 |
+| 重试 | 无 | 429/5xx/网络错误指数退避 |
+| 并发控制 | 无（并发 2 必定 429） | 信号量 + 同流去重 |
+| 发送结果判定 | 不检查返回值 | 发送失败也计入失败并降级 |
+| 音高/语速/响度 | 不支持（接口忽略这些参数） | 本地 ffmpeg 后处理，10 项可调 |
+| 音色取错 | preset 模式会拿 clone 的文件名 | 两条路径分离 |
+| 热重载清空密钥 | 旧密钥仍留在内存计费 | 重建实例 |
+| 工具可见性 | 默认 deferred，需先 `tool_search` | `visibility="visible"` 常驻 |
+| 配置项 | 9 项 | 29 项，全部有默认值 |
+
+改动明细见 [CHANGELOG.md](./CHANGELOG.md)。
+
+## 快速开始
+
+### 1. 放进插件目录
 
 ```bash
 cd /path/to/MaiBot/plugins/
-git clone https://github.com/Emilia-awa/maibot-mimotts-voice.git
+git clone https://github.com/m1o0/maibot-mimotts-voice.git
 ```
 
-### 2. 安装依赖
+### 2. 装依赖
 
 ```bash
 pip install aiohttp
 ```
 
-> 可选：只有配置了 `[audio]` 里的调音项才需要 **ffmpeg**（音高/语速/响度等本地后处理）。
-> 保持全默认时不会调用它，没装也不影响语音发送。
+> 只有配置了 `[audio]` 里的调音项才需要 **ffmpeg**。全默认时不会调用它，没装也不影响语音发送。
 > 验证：`ffmpeg -version` 能输出版本号即可。
 
-### 3. 配置
+### 3. 填 API Key
 
-编辑 `config.toml`（可从 `config.example.toml` 复制）：
+首次启动会自动从 `config.example.toml` 生成 `config.toml`，编辑它：
 
 ```toml
-[plugin]
-enabled = true
-config_version = "1.0.0"
-
 [voice]
-mimo_api_key = "your_api_key_here"
+mimo_api_key = "你的密钥"
 api_base_url = "https://token-plan-cn.xiaomimimo.com/v1"
-voice_mode = "clone"          # 或 "preset"
-preset_voice = "mimo_default"  # 仅 preset 模式生效
-voices_dir = "voices"
-default_voice = "salt"         # clone 模式默认音色，填 voices/ 里的文件名（不含扩展名）
-clone_voice = "salt"
-audio_format = "mp3"
-
-[request]
-request_timeout = 45.0
-connect_timeout = 10.0
-max_retries = 2
-retry_backoff = 1.5
-max_concurrency = 1
-
-[fallback]
-fallback_to_text = true
-empty_text_placeholder = "（想说点什么，但声音没发出来）"
-strip_audio_tags = true
-skip_when_busy = true
+voice_mode = "clone"
+default_voice = "salt"   # voices/salt.mp3 的文件名，不含扩展名
 ```
 
-### 4. 重启 MaiBot
+然后在 `voices/` 放一段参考音频（建议 ≥30 秒、无背景噪音）。重启 MaiBot，插件会自动加载。
 
-插件会自动加载。之后修改 `config.toml` 会触发热重载，无需重启。
+之后改 `config.toml` 会热重载，不用重启。
+
+## 功能
+
+### 语音合成
+
+- **音色复刻**：`voices/` 里放音频即可，文件名就是音色名
+- **预置音色**：9 种内置音色（中文/英文，男声/女声）
+- **三种风格控制**：自然语言指令、导演模式（角色/场景/指导）、句内音频标签（`（轻笑）`/`(sighs)`）
+
+风格由 AI 根据角色人设自己决定，不需要用户手动指定。插件只负责把 AI 的描述翻译成语音。
+
+### 可靠性
+
+- **超时降级**：超过 `request_timeout` 立即改发文字，不让用户干等
+- **智能重试**：只对 429/5xx/网络错误重试；超时不重试（再等只会更久）
+- **并发保护**：全局信号量 + 同聊天流去重，避免堆叠触发限流
+- **发送结果判定**：`send.custom` 返回失败也算失败，会降级
+- **标签剥离**：降级发文字时剥掉 `（轻笑）` 这类只对 TTS 有意义的标签，**只剥白名单**——
+  「宝宝（明天要早起）早点睡」不会变成「宝宝早点睡」
+
+### 本地调音（可选）
+
+MiMo 接口**忽略** `speed`、`emotion` 等参数（实测传与不传，返回音频字节级一致）。想调声音只能在本地做：
+
+| 项目 | 支持 |
+|---|---|
+| 音高 | `pitch_semitones`，半音单位，保留共振峰（不像慢放） |
+| 语速 | `speed`，`0.9` 更温柔，`1.1` 更活泼 |
+| 响度 | `loudness_normalize`，把每句拉到同一水平 |
+| 其他 | 高通去低频、音量增益、淡入淡出、去首尾静音 |
+
+音高对照：
+
+| 取值 | 基频变化 | 听感 |
+|------|---------|------|
+| `-3` | 约 −16% | 明显成熟，接近成年女性 |
+| `-2` | 约 −11% | 偏沉稳 |
+| `-1.5` | 约 −8% | 温柔，仍保留少女感 |
+| `-1` | 约 −6% | 微微变柔 |
+| `0` | 不变 | 原样 |
+| `+1` | 约 +6% | 更幼更尖 |
+
+> 不知道调多少就从 `-1` 或 `-1.5` 开始。超过 `-3` 会从「少女」滑向「成年女性」，配猫娘一类人设容易不搭。
+
+一个常见组合（更柔和的少女音）：
+
+```toml
+[audio]
+pitch_semitones = -1.5
+speed = 0.95
+loudness_normalize = true
+fade_ms = 40
+```
+
+ffmpeg 处理约 0.2~0.5 秒（一段 8 秒语音）。找不到 ffmpeg 时只警告一次并跳过，**语音照常发送**。
 
 ## 配置说明
 
@@ -83,85 +143,37 @@ skip_when_busy = true
 | `api_base_url` | API 地址 | `https://token-plan-cn.xiaomimimo.com/v1` |
 | `voice_mode` | 音色模式：`preset` 或 `clone` | `clone` |
 | `preset_voice` | 预置音色名称（**仅 preset 模式生效**） | `mimo_default` |
-| `voices_dir` | 音色复刻目录（clone 模式，相对于插件目录） | `voices` |
-| `default_voice` | clone 模式默认音色，填 `voices/` 下的文件名（不含扩展名） | - |
-| `clone_voice` | clone 模式兜底音色；`default_voice` 找不到时使用 | - |
-| `audio_format` | 输出格式：`wav` / `mp3` / `pcm` / `pcm16`（`mp3` 体积约为 `wav` 的 1/6，上传更快；`pcm`/`pcm16` 是同样参数的裸流，一般不需要用） | `mp3` |
+| `voices_dir` | 音色复刻目录（相对插件目录） | `voices` |
+| `default_voice` | clone 模式默认音色（文件名，不含扩展名） | - |
+| `clone_voice` | clone 模式兜底音色 | - |
+| `audio_format` | `wav` / `mp3` / `pcm` / `pcm16`。`mp3` 体积约为 `wav` 的 1/6 | `mp3` |
 
 ### `[request]`
 
 | 配置项 | 说明 | 默认值 |
 |--------|------|--------|
-| `request_timeout` | 单次合成总超时（秒）。超时后降级发文字 | `45.0` |
+| `request_timeout` | 单次合成总超时（秒），超时改发文字 | `45.0` |
 | `connect_timeout` | 建立连接超时（秒） | `10.0` |
-| `max_retries` | 429/5xx/网络错误的**重试**次数（不含首次） | `2` |
+| `max_retries` | 429/5xx/网络错误的重试次数（不含首次） | `2` |
 | `retry_backoff` | 退避基数（秒），按 `base * 2^(n-1)` 增长 | `1.5` |
-| `max_concurrency` | 全局同时进行的合成请求上限 | `1` |
+| `max_concurrency` | 全局并发上限 | `1` |
 
-> 说明：**超时不会重试**。上游抖动时再等一轮只会让用户等更久，
-> 直接降级发文字能更快把内容送到用户面前。
+> **超时不会重试。** 上游抖动时再等一轮只会让用户等更久，直接降级发文字能更快把内容送到。
 
-> `max_concurrency` 默认为 `1` 是实测结论：并发 2 时必定出现
-> `429 Too many requests`，串行调用则 5/5 成功。若你的套餐额度更高可以适当上调。
+> `max_concurrency` 默认 `1` 是实测结论：并发 2 必定 `429 Too many requests`，串行则 5/5 成功。
 
 ### `[fallback]`
 
 | 配置项 | 说明 | 默认值 |
 |--------|------|--------|
-| `fallback_to_text` | 语音失败/超时时把内容改发文字 | `true` |
-| `empty_text_placeholder` | 降级时正文被标签清空后用的兜底文案（留空则不发） | `（想说点什么，但声音没发出来）` |
-| `strip_audio_tags` | 降级发文字时剥掉 `（轻笑）(sighs)` 这类只对 TTS 有意义的标签 | `true` |
-| `skip_when_busy` | 同一聊天流已有语音在合成时，本次直接改发文字 | `true` |
+| `fallback_to_text` | 语音失败/超时时改发文字 | `true` |
+| `empty_text_placeholder` | 正文被标签清空后的兜底文案（留空则不发） | `（想说点什么，但声音没发出来）` |
+| `strip_audio_tags` | 降级时剥掉只对 TTS 有意义的标签 | `true` |
+| `skip_when_busy` | 同流已有语音在合成时，本次直接发文字 | `true` |
 
-### `[audio]` — 自定义音色观感
+### `[audio]`
 
-MiMo 只负责把文字念出来，**不提供音高、语速、响度这些调音参数**
-（实测 `audio.speed`、`audio.emotion` 和顶层 `speed` 都被服务端静默忽略，
-返回音频与不传时字节级一致）。所以想调声音只能在本地做。
-
-开启这一节需要系统里有 [ffmpeg](https://ffmpeg.org/download.html)。
-**全部保持默认值时不会调用 ffmpeg**，也没有任何额外开销。
-
-| 配置项 | 说明 | 默认值 |
-|--------|------|--------|
-| `ffmpeg_path` | ffmpeg 命令名（走 PATH）或绝对路径 | `ffmpeg` |
-| `pitch_semitones` | **音高**，半音单位。负数降调更沉稳，正数升调更幼 | `0.0` |
-| `preserve_formant` | 降调时保留共振峰（音色更自然，不然像慢放） | `true` |
-| `speed` | **语速**倍率。`0.9` 更温柔，`1.1` 更活泼 | `1.0` |
-| `loudness_normalize` | **响度标准化**，把每句音量拉到同一水平 | `false` |
-| `loudness_target` | 响度目标（LUFS），`-16` 适合语音，`-14` 接近流媒体 | `-16.0` |
-| `highpass_hz` | 高通滤波，去掉低频轰隆声。`0` 关闭，常用 `80` | `0` |
-| `volume_db` | 额外音量增益（dB） | `0.0` |
-| `fade_ms` | **首尾淡入淡出**（毫秒），消除开头爆音 | `0` |
-| `trim_silence` | 去掉首尾多余静音 | `false` |
-
-音高对照（`pitch_semitones` → 基频变化）：
-
-| 取值 | 基频变化 | 听感 |
-|------|---------|------|
-| `-3` | 约 −16% | 明显成熟，接近成年女性 |
-| `-2` | 约 −11% | 偏沉稳 |
-| `-1.5` | 约 −8% | 温柔，仍保留少女感 |
-| `-1` | 约 −6% | 微微变柔 |
-| `0` | 不变 | 原样 |
-| `+1` | 约 +6% | 更幼更尖 |
-
-> 不知道该调多少时，从 `-1` 或 `-1.5` 开始。
-> 超过 `-3` 会从"少女"滑向"成年女性"，和猫娘一类的角色人设容易不搭。
-
-一个常见的组合（更柔和的少女音）：
-
-```toml
-[audio]
-pitch_semitones = -1.5
-speed = 0.95
-loudness_normalize = true
-fade_ms = 40
-trim_silence = true
-```
-
-> ffmpeg 处理耗时约 0.2~0.5 秒（一段 8 秒语音）。
-> 找不到 ffmpeg 时只会警告一次并跳过处理，**语音照常发送**，不会因此失败。
+完整字段见上方[本地调音](#本地调音可选)，或 [config.example.toml](./config.example.toml) 的逐项注释。
 
 ### API 地址
 
@@ -173,8 +185,6 @@ trim_silence = true
 ## 音色模式
 
 ### 预置音色（preset）
-
-无需额外配置，直接在 `preset_voice` 中填入音色名称：
 
 | 音色名 | 语言 | 性别 |
 |--------|------|------|
@@ -190,57 +200,41 @@ trim_silence = true
 
 ### 音色复刻（clone）
 
-1. 将 `voice_mode` 改为 `clone`
-2. 将参考音频文件放入 `voices/` 目录（支持 WAV 和 MP3）
-3. 文件名即为音色名称，建议录音时长 30 秒以上
-4. 在 `default_voice` 填入该文件名（不含扩展名）
-
 ```
 plugins/maibot-mimotts-voice/voices/
-└── salt.wav    # 音色名称: salt
+└── salt.wav    # 音色名: salt
 ```
 
-> 音色匹配顺序：`send_voice_reply` 传入的 `voice_name` → `default_voice` → `clone_voice`。
-> 都找不到时会记录一条 error 日志并列出可用音色，不会静默换音色。
+> 匹配顺序：`voice_name` 参数 → `default_voice` → `clone_voice`。
+> 都找不到时记一条 error 并列出可用音色，**不会静默换音色**。
 
 ## 工具说明
 
-插件提供 `send_voice_reply` 工具给 AI，AI 会根据对话上下文自行判断是否调用。
+插件给 AI 注册 `send_voice_reply`：
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `reply_text` | string | ✅ | 要合成语音的回复文本 |
-| `msg_id` | string | ✅ | 当前消息 ID，用于自动查找聊天流 |
-| `style_instruction` | string | ❌ | 语音风格指令 |
+| `reply_text` | string | ✅ | 要合成的文本 |
+| `msg_id` | string | ✅ | 当前消息 ID |
+| `style_instruction` | string | ❌ | 风格指令 |
 
 ### 聊天流定位
 
-`send_voice_reply` 按以下顺序确定语音发往哪个聊天流：
+1. 宿主注入的 `stream_id` / `chat_id` / `session_id`（绝大多数情况）
+2. 用 `msg_id` 反查消息归属会话
+3. **仅当全局只有一个群会话时**才兜底
 
-1. 宿主在工具调用时注入的 `stream_id` / `chat_id` / `session_id`（绝大多数情况）
-2. 用 `msg_id` 反查消息归属的会话
-3. **仅在全局只有一个群会话时**，才用该会话兜底
+第 3 步的限制是有意的：早期版本无条件取「第一个群会话」，多群环境下会把私聊语音发进群里。现在宁可放弃发送并降级文字，也不串流。
 
-第 3 步的严格限制是有意为之：早期版本无条件取「第一个群会话」，
-在多群环境下会把私聊的语音发进群里。现在宁可放弃发送并降级发文字，也不串流。
+### 风格控制
 
-### 风格控制方式
+**1. 自然语言指令**（AI 填 `style_instruction`）
 
-风格控制由 AI 根据当前扮演的角色人设和对话情境**自行决定**，无需用户手动指定。AI 会自动判断何时需要风格指令，并选择合适的表达方式。
+```
+一位温柔的少女，声音清甜软糯，语速偏慢，用安慰的语气，带点关切
+```
 
-支持三种风格控制方式，AI 可自由组合使用：
-
-**1. 自然语言风格指令**（AI 通过 `style_instruction` 参数传入）
-
-AI 用自然语言描述语气、情绪、语速等，像给演员说戏一样：
-
-- `一位温柔的少女，声音清甜软糯，语速偏慢，用安慰的语气`
-- `语气俏皮活泼，带点小得意，语速偏快`
-- `声音低沉严肃，像在教训人，语速慢一些`
-
-**2. 导演模式**（AI 根据场景需要自动启用）
-
-AI 从角色、场景、指导三个维度全方位刻画表演：
+**2. 导演模式**（角色 / 场景 / 指导）
 
 ```
 角色：一位温柔的大姐姐，性格体贴温暖，声音甜美有亲和力。
@@ -248,93 +242,83 @@ AI 从角色、场景、指导三个维度全方位刻画表演：
 指导：语调柔和温暖，气息松弛，偶尔带叹息，语速偏慢，尾音上扬带笑意。
 ```
 
-**3. 音频标签**（AI 在 `reply_text` 中自动插入）
+**3. 音频标签**（AI 写在 `reply_text` 里）
 
-AI 在文本任意位置用括号标注语气/情绪/声音动作：
+```
+（紧张）呼……冷静。（叹气）算了。（轻笑）好吧好吧。
+(sighs) I don't know. (laughs) That's funny!
+```
 
-- 中文：`（紧张）呼……冷静。（叹气）算了。（轻笑）好吧好吧。`
-- 英文：`(sighs) I don't know. (laughs) That's funny!`
-- 整段风格：`（温柔）你好呀~` `（东北话）哎呀妈呀~` `（唱歌）歌词...`
-- 常用标签：开心/悲伤/愤怒/温柔/慵懒/俏皮/磁性/沙哑/甜美/冷漠/叹气/轻笑/哽咽/深呼吸 等
-
-> `style_instruction`（整体风格）+ `reply_text` 中的音频标签（句内细节）可同时使用，两者不冲突。
->
-> 语音合成失败降级发文字时，插件会剥掉这些标签（`[fallback] strip_audio_tags`）。
-> 剥离只针对白名单里的语气/动作词，普通括号内容一律保留——
-> 「宝宝（明天要早起）早点睡」不会变成「宝宝早点睡」。
-
-> 若 AI 未填写 `style_instruction`，插件会使用一段中性的默认风格（只描述音色与生活化的在场感，
-> 不指定语气情绪），避免与用户为该聊天流单独配置的人格提示词冲突。
+> `style_instruction` 管整体风格，标签管句内细节，两者不冲突。
+> AI 不填时使用一段中性默认风格（只描述音色与生活化的在场感，不指定情绪），避免与用户单独配置的人格提示词冲突。
 
 ## 常见问题
 
-**Q：日志显示合成成功，但用户没收到语音？**
+**Q：日志说合成成功，但用户没收到语音？**
 
-A：v1.7.0 起会把「发送结果」也计入成功判定；发送失败会自动降级发文字。
+A：v1.7.0 起发送结果也计入成功判定，发送失败会自动降级文字。
 若仍无内容，检查 `[fallback] fallback_to_text` 是否为 `false`。
 
-**Q：语音要等很久才出现？**
+**Q：语音要等很久？**
 
-A：MiMo 接口延迟波动很大（实测同一句话 4.5s ~ 160s+，与文本长度无关）。
-v1.7.0 起超过 `request_timeout` 会放弃合成并立即改发文字。
-如果经常触发，可以适当调高 `request_timeout`，或把 `audio_format` 改为 `mp3` 减小传输体积。
+A：MiMo 延迟波动很大（实测 4.5s ~ 160s+，与文本长度无关）。超过 `request_timeout` 会放弃并改发文字。
+经常触发的话，调高 `request_timeout`，或把 `audio_format` 改成 `mp3` 减小传输体积。
 
-> 若 `[audio]` 里把 `speed` 调到 1 以下（放慢语速），语音本身会变长，
-> 此时建议把 `request_timeout` 一并调大（例如 `60.0`），避免长句被超时切断。
+> 若把 `[audio] speed` 调到 1 以下，语音会变长，建议把 `request_timeout` 一并调大（如 `60.0`）。
 
-**Q：频繁出现 429？**
+**Q：频繁 429？**
 
-A：上游对并发有速率限制。调低 `max_concurrency`（如设为 `1`），
-并保持 `skip_when_busy = true` 可显著减少。
+A：上游对并发有限制。保持 `max_concurrency = 1` 与 `skip_when_busy = true` 可显著减少。
 
-**Q：换了 API Key 但要重启才生效？**
+**Q：开了 `[audio]` 后语音发不出来 / ffmpeg 报错？**
 
-A：v1.7.0 起不需要。配置变更会重建服务实例并关闭旧连接池。
+A：不会导致发不出去。处理失败时只打一条 warning，**未处理的原始音频照常发出**。
+找不到 ffmpeg 时保持 `[audio]` 全默认（`pitch_semitones = 0` 且 `speed = 1.0`），此时完全不调用 ffmpeg。
 
-**Q：语音音调偏高/偏低，或者语速偏快，能调吗？**
+**Q：改了 `config.toml` 要重启吗？**
 
-A：能，用 `[audio]` 段。MiMo 接口本身不接受音高、语速参数，所以这部分是插件在本地用
-ffmpeg 做的，需要系统里有 ffmpeg。
-- 调音高：`pitch_semitones = -1.5` 就是降 1.5 个半音，不知道调多少先试 `-1`。
-- 调语速：`speed = 0.95` 会整体放慢 5%，**不改变音高**；`1.05` 则稍快。
-详见上面的 `[audio]` 说明。
+A：不用。配置热重载会重建 TTS 服务，密钥/音色/超时/调音参数即时生效。
 
-**Q：开启 `[audio]` 后语音发不出来 / 日志里有 ffmpeg 报错？**
+## 与上游的关系
 
-A：不会导致发不出去。处理失败时插件会打一条 warning 并**把未处理的原始音频照常发出去**。
-如果日志提示找不到 ffmpeg，确认 `ffmpeg -version` 能跑；不想装就让 `[audio]` 段保持全默认
-（`pitch_semitones = 0` 且 `speed = 1.0`），此时 `build_audio_processor()` 返回 `None`，
-插件完全不会调用 ffmpeg。
+这是 [Emilia-awa/maibot-mimotts-voice](https://github.com/Emilia-awa/maibot-mimotts-voice) 的 fork，
+基于上游 `8ccfa7e`（v1.6.0）。
 
-## 目录结构
+上游的语音发送修复见 [PR #3](https://github.com/Emilia-awa/maibot-mimotts-voice/pull/3)（作者 [@Doulor](https://github.com/Doulor)），
+本 fork 采用同样的 `send.custom("voice", raw_base64)` 思路，并在此之上补完了错误处理链路。
 
-```
-maibot-mimotts-voice/
-├── plugin.py             # 插件主入口
-├── tts_service.py        # MiMo TTS 服务封装
-├── audio_processor.py    # 本地音频后处理（音高/语速/响度，可选）
-├── config.toml           # 插件配置（gitignored）
-├── config.example.toml   # 配置示例
-├── _manifest.json        # 插件清单
-├── README.md             # 本文档
-├── CHANGELOG.md          # 更新日志
-├── LICENSE               # MIT 许可证
-├── .gitignore            # Git 忽略规则
-├── requirements.txt      # Python 依赖
-└── voices/               # 音色复刻文件目录（gitignored）
+原作者与许可证信息保留在 [LICENSE](./LICENSE) 与 `_manifest.json` 的 `author` 字段中。
+
+**同步上游更新：**
+
+```bash
+git fetch upstream
+git merge upstream/main
 ```
 
-## 更新日志
+## 开发
 
-见 [CHANGELOG.md](./CHANGELOG.md)。
+```bash
+# 语法检查
+python -m py_compile plugin.py tts_service.py audio_processor.py
+
+# 把 config.example.toml 解析一遍，确认没写错
+python -c "import tomllib,pathlib;tomllib.loads(pathlib.Path('config.example.toml').read_text(encoding='utf-8'))"
+```
+
+工程约定：
+
+- 所有新增配置项必须有默认值，**不破坏老配置**（缺段自动补）
+- 所有对外部服务（TTS API、ffmpeg）的调用失败都必须降级，不向上抛
+- 修改发送链时，同时验证 `wav` 与 `mp3` 两种格式（SnowLuma 需转 silk）
 
 ## 注意事项
 
-1. **API Key**：需要在 [小米 MiMo 平台](https://platform.xiaomimimo.com) 申请
-2. **音色复刻**：建议录音时长不低于 30 秒，确保无背景噪音
-3. **Base64 大小**：音色参考音频的 Base64 编码不能超过 10MB
+1. **API Key**：在 [小米 MiMo 平台](https://platform.xiaomimimo.com) 申请
+2. **音色复刻**：录音 ≥30 秒、无背景噪音效果最好
+3. **Base64 上限**：音色参考音频 Base64 后不能超过 10MB
 4. **费用**：MiMo-V2.5-TTS 系列当前限时免费
 
 ## 许可证
 
-MIT License
+[MIT](./LICENSE) © Emilia-awa
