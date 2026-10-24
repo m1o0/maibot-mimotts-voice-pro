@@ -6,7 +6,7 @@
 
 基于小米 MiMo-V2.5-TTS 的语音插件，把文字回复变成有情绪、有音色、有停顿的语音。
 
-![version](https://img.shields.io/badge/version-1.9.0-blue)
+![version](https://img.shields.io/badge/version-1.9.1-blue)
 ![python](https://img.shields.io/badge/python-3.9%2B-3776AB)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![platform](https://img.shields.io/badge/MaiBot-%E2%89%A51.0.0-orange)
@@ -29,7 +29,7 @@
 
 上游版本停在 v1.6.0（2026-05），这个 fork 在其基础上重做了错误处理链路，并新增本地音频后处理。
 
-| | 上游 v1.6.0 | 本 fork v1.9.0 |
+| | 上游 v1.6.0 | 本 fork v1.9.1 |
 |---|---|---|
 | 聊天流定位 | 拿不到时取「第一个群会话」 | 三级优先级，多群时放弃而非串群 |
 | 合成超时 | 会话级硬编码 60s，超时静默失败 | 每请求独立超时，超时改发文字 |
@@ -287,7 +287,8 @@ A：不用。配置热重载会重建 TTS 服务，密钥/音色/超时/调音�
 上游的语音发送修复见 [PR #3](https://github.com/Emilia-awa/maibot-mimotts-voice/pull/3)（作者 [@Doulor](https://github.com/Doulor)），
 本 fork 采用同样的 `send.custom("voice", raw_base64)` 思路，并在此之上补完了错误处理链路。
 
-原作者与许可证信息保留在 [LICENSE](./LICENSE) 与 `_manifest.json` 的 `author` 字段中。
+原作者与许可证信息保留在 [LICENSE](./LICENSE)（含 Emilia-awa 与 m1o0 两行版权声明）。
+`_manifest.json` 的 `author` 填的是本 fork 的维护者，因为插件市场会把它显示在插件卡片上。
 
 > **插件 ID 已改为 `m1o0.maibot-mimotts-voice-pro`。**
 > 上游 ID 是 `Emilia-awa.maibot-mimotts-voice`，两者不同是有意为之——
@@ -326,4 +327,4 @@ python -c "import tomllib,pathlib;tomllib.loads(pathlib.Path('config.example.tom
 
 ## 许可证
 
-[MIT](./LICENSE) © Emilia-awa
+[MIT](./LICENSE) © Emilia-awa, m1o0
