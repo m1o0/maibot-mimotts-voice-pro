@@ -76,14 +76,45 @@ class AudioOptions:
 class AudioProcessor:
     """把 ffmpeg 滤镜链包装成一个可 await 的调用。"""
 
-    def __init__(self, options: AudioOptions, logger: Optional[logging.Logger] = None) -> None:
+    def __init__(
+        self,
+        options: AudioOptions,
+        logger: Optional[logging.Logger] = None,
+        work_dir: Optional[Path] = None,
+    ) -> None:
+        """初始化处理器。
+
+        Args:
+            options: 调音参数。
+            logger: 日志器。
+            work_dir: ffmpeg 中转文件目录。传 `ctx.paths.runtime_dir` 可让中间
+                音频落在宿主为本插件分配的运行时目录里，按插件生命周期管理；
+                不传则退回系统临时目录（仍会即时清理）。
+        """
         self.options = options
         self.logger = logger or logging.getLogger(__name__)
+        self.work_dir = work_dir
         # 只在首次真正需要处理时才去解析 ffmpeg 路径并做一次可用性检查，
         # 避免不加处理的用户白白承担一次 shutil.which。
         self._ffmpeg: Optional[str] = None
         self._resolved = False
         self._warned_unavailable = False
+
+    # ------------------------------------------------------------------ 临时目录
+
+    def _make_tmpdir(self) -> str:
+        """建一个本次处理专用的临时目录。
+
+        runtime_dir 不可写时（权限、磁盘、宿主版本差异）不能因此放弃调音，
+        退回系统临时目录即可——那正是改动前的行为。
+        """
+        if self.work_dir is not None:
+            try:
+                self.work_dir.mkdir(parents=True, exist_ok=True)
+                return tempfile.mkdtemp(prefix="mimotts_audio_", dir=str(self.work_dir))
+            except OSError as exc:
+                self.logger.debug("runtime_dir 不可用（%r），退回系统临时目录", exc)
+        return tempfile.mkdtemp(prefix="mimotts_audio_")
 
     # ------------------------------------------------------------------ ffmpeg 定位
 
@@ -221,7 +252,7 @@ class AudioProcessor:
         suffix = ".pcm" if fmt in ("pcm", "pcm16") else f".{fmt}"
         tmpdir = None
         try:
-            tmpdir = tempfile.mkdtemp(prefix="mimotts_audio_")
+            tmpdir = self._make_tmpdir()
             src = Path(tmpdir) / f"in{suffix}"
             dst = Path(tmpdir) / f"out{suffix}"
             src.write_bytes(audio)
@@ -276,8 +307,18 @@ class AudioProcessor:
                 shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def build_audio_processor(config: object, logger: Optional[logging.Logger] = None) -> Optional[AudioProcessor]:
-    """从插件配置构建处理器；全部默认值时返回 None（不产生任何开销）。"""
+def build_audio_processor(
+    config: object,
+    logger: Optional[logging.Logger] = None,
+    work_dir: Optional[Path] = None,
+) -> Optional[AudioProcessor]:
+    """从插件配置构建处理器；全部默认值时返回 None（不产生任何开销）。
+
+    Args:
+        config: 插件配置（读取其中的 `audio` 段）。
+        logger: 日志器。
+        work_dir: ffmpeg 中转文件目录，通常传 `ctx.paths.runtime_dir`。
+    """
     section = getattr(config, "audio", None)
     if section is None:
         return None
@@ -296,4 +337,4 @@ def build_audio_processor(config: object, logger: Optional[logging.Logger] = Non
     )
     if options.is_noop:
         return None
-    return AudioProcessor(options, logger=logger)
+    return AudioProcessor(options, logger=logger, work_dir=work_dir)

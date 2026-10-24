@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import re
+import urllib.parse
 from pathlib import Path
 from typing import Any, Optional
 
@@ -55,6 +56,44 @@ def _strip_audio_tags(text: str) -> str:
     cleaned = _AUDIO_TAG_RE.sub("", text or "")
     cleaned = _AUDIO_TAG_SPACE_RE.sub(" ", cleaned)
     return cleaned.strip()
+
+
+# 内网 / 本机网段：请求打到这些地址时，API Key 只会在局域网内暴露，风险相对可控，
+# 但仍值得提示——用户可能以为自己连的是公网服务。
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"})
+
+
+def _describe_insecure_base_url(raw_url: str) -> str:
+    """检查 api_base_url 是否会把密钥以明文发到不安全的目的地。
+
+    `api_base_url` 是完全可以自定义的配置项：如果用户写成 `http://...`，
+    或者写错域名解析到别处，API Key 和复刻参考音频就会以明文发出。
+    这里只做**检测并告警**，绝不阻断——配置写错时语音仍应能工作，
+    把用户卡死在「配置报错但不知道为什么」比多打一条 warning 更糟。
+
+    Args:
+        raw_url: 用户配置的 API 地址。
+
+    Returns:
+        str: 需要提示的原因；地址安全或为空串时返回空串。
+    """
+    url = (raw_url or "").strip()
+    if not url:
+        return ""
+
+    parsed = urllib.parse.urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.hostname or "").lower()
+
+    if not scheme:
+        return f"API 地址 {url!r} 缺少协议头，将按 http 处理，密钥会以明文传输"
+    if scheme != "https":
+        if host in _LOOPBACK_HOSTS:
+            return ""
+        return f"API 地址 {url!r} 使用 {scheme}（非 https），API Key 与参考音频会以明文传输"
+    if not host:
+        return f"API 地址 {url!r} 解析不出主机名，请检查是否写错"
+    return ""
 
 
 class PluginSectionConfig(PluginConfigBase):
@@ -205,6 +244,12 @@ class AIVoicePlugin(MaiBotPlugin):
     def _rebuild_tts_service(self) -> None:
         """按当前配置重建 TTS 服务实例（热重载时同样走这里）。"""
         request_cfg = self.config.request
+        insecure_reason = _describe_insecure_base_url(self.config.voice.api_base_url)
+        if insecure_reason:
+            self.ctx.logger.warning(
+                "%s。如果这不是你有意为之，请把 voice.api_base_url 改成 https 地址",
+                insecure_reason,
+            )
         self.tts_service = MiMoTTSService(
             api_key=self.config.voice.mimo_api_key,
             api_base_url=self.config.voice.api_base_url,
@@ -219,7 +264,11 @@ class AIVoicePlugin(MaiBotPlugin):
 
     def _rebuild_audio_processor(self) -> None:
         """按当前配置重建音频处理器；没有任何处理项时为 None。"""
-        self.audio_processor = build_audio_processor(self.config, logger=self.ctx.logger)
+        self.audio_processor = build_audio_processor(
+            self.config,
+            logger=self.ctx.logger,
+            work_dir=getattr(getattr(self.ctx, "paths", None), "runtime_dir", None),
+        )
         if self.audio_processor is not None:
             chain = self.audio_processor.build_filter_chain()
             self.ctx.logger.info("音频后处理已启用: %s", chain)

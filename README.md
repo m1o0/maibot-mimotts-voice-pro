@@ -6,7 +6,7 @@
 
 基于小米 MiMo-V2.5-TTS 的语音插件，把文字回复变成有情绪、有音色、有停顿的语音。
 
-![version](https://img.shields.io/badge/version-1.9.1-blue)
+![version](https://img.shields.io/badge/version-1.9.2-blue)
 ![python](https://img.shields.io/badge/python-3.9%2B-3776AB)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![platform](https://img.shields.io/badge/MaiBot-%E2%89%A51.0.0-orange)
@@ -29,7 +29,7 @@
 
 上游版本停在 v1.6.0（2026-05），这个 fork 在其基础上重做了错误处理链路，并新增本地音频后处理。
 
-| | 上游 v1.6.0 | 本 fork v1.9.1 |
+| | 上游 v1.6.0 | 本 fork v1.9.2 |
 |---|---|---|
 | 聊天流定位 | 拿不到时取「第一个群会话」 | 三级优先级，多群时放弃而非串群 |
 | 合成超时 | 会话级硬编码 60s，超时静默失败 | 每请求独立超时，超时改发文字 |
@@ -140,7 +140,7 @@ ffmpeg 处理约 0.2~0.5 秒（一段 8 秒语音）。找不到 ffmpeg 时只�
 | 配置项 | 说明 | 默认值 |
 |--------|------|--------|
 | `mimo_api_key` | MiMo API Key（必填） | - |
-| `api_base_url` | API 地址 | `https://token-plan-cn.xiaomimimo.com/v1` |
+| `api_base_url` | API 地址。**必须是 https**，否则 API Key 与参考音频会明文传输（插件会告警） | `https://token-plan-cn.xiaomimimo.com/v1` |
 | `voice_mode` | 音色模式：`preset` 或 `clone` | `clone` |
 | `preset_voice` | 预置音色名称（**仅 preset 模式生效**） | `mimo_default` |
 | `voices_dir` | 音色复刻目录（相对插件目录） | `voices` |
