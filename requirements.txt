@@ -1,1 +1,5 @@
+# 插件自身的第三方依赖。
+# 注意：不要在这里声明 maibot-plugin-sdk —— 它由 MaiBot 宿主自带
+# （宿主 requirements.txt 里有 maibot-plugin-sdk>=2.7.1），在这里重复声明
+# 可能在用户机器上把宿主的 SDK 升级或降级，反而弄坏插件运行环境。
 aiohttp>=3.8.0

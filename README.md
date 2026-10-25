@@ -6,10 +6,11 @@
 
 基于小米 MiMo-V2.5-TTS 的语音插件，把文字回复变成有情绪、有音色、有停顿的语音。
 
-![version](https://img.shields.io/badge/version-1.9.9-blue)
-![python](https://img.shields.io/badge/python-3.9%2B-3776AB)
+![version](https://img.shields.io/badge/version-1.9.10-blue)
+![python](https://img.shields.io/badge/python-3.10%2B-3776AB)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![platform](https://img.shields.io/badge/MaiBot-%E2%89%A51.0.0-orange)
+![CI](https://github.com/m1o0/maibot-mimotts-voice-pro/actions/workflows/ci.yml/badge.svg)
 
 [快速开始](#快速开始) · [功能](#这个-fork-做了什么) · [配置](#配置说明) · [常见问题](#常见问题) · [与上游的关系](#与上游的关系)
 
@@ -56,9 +57,13 @@ git clone https://github.com/m1o0/maibot-mimotts-voice-pro.git
 ### 2. 装依赖
 
 ```bash
-pip install aiohttp
+pip install -r requirements.txt
 ```
 
+> **`maibot-plugin-sdk` 不需要自己装** —— 它由 MaiBot 宿主自带（宿主自身的 `requirements.txt` 里就有）。插件自己的 `requirements.txt` 只声明 `aiohttp`，刻意不重复声明 SDK，避免在用户机器上改动宿主环境。
+>
+> 运行需要 **Python 3.10+**（`maibot-plugin-sdk` 的下限）。
+>
 > 只有配置了 `[audio]` 里的调音项才需要 **ffmpeg**。全默认时不会调用它，没装也不影响语音发送。
 > 验证：`ffmpeg -version` 能输出版本号即可。
 

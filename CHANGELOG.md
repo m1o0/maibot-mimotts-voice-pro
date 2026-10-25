@@ -2,6 +2,24 @@
 
 本文件记录插件各版本的变化。遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.9.10] - 2026-10-25
+
+### 新增
+
+- **GitHub Actions CI**（`.github/workflows/ci.yml`）。每次 push / PR 自动跑：
+  Python 3.10、3.11、3.12 三个版本下的字节编译与 69 项回归测试、
+  `_manifest.json` 的 12 个必需字段与版本格式校验、
+  以及一道守卫（禁止提交 `config.toml`、`voices/` 下的音色文件、疑似 API Key）。
+  失败会直接标红，不用等别人发现问题。
+
+### 变更
+
+- `requirements.txt` 补了注释说明**为什么刻意不声明 `maibot-plugin-sdk`**：
+  该包由 MaiBot 宿主自带，插件重复声明可能在用户机器上改动宿主环境。
+- README 的 Python 版本徽章从 `3.9+` 修正为 **`3.10+`** —— SDK 的实际下限是 3.10，
+  原来的 3.9 是错的。依赖安装改为 `pip install -r requirements.txt`，
+  并写明 SDK 不需要自己装。
+
 ## [1.9.9] - 2026-10-25
 
 ### 新增

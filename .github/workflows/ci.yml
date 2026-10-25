@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # maibot-plugin-sdk 要求 >=3.10；3.12 是 MaiBot 本体当前使用的版本
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install "maibot-plugin-sdk>=2.8"
+
+      - name: Byte-compile
+        run: python -m py_compile plugin.py tts_service.py audio_processor.py tests/test_plugin.py
+
+      - name: Run tests
+        run: python tests/test_plugin.py
+
+      - name: Validate manifest
+        run: |
+          python - <<'PY'
+          import json, pathlib, re, sys
+
+          path = pathlib.Path("_manifest.json")
+          m = json.loads(path.read_text(encoding="utf-8"))
+          errors = []
+
+          # manifest v2 必需字段
+          required = ["manifest_version", "id", "version", "name", "description",
+                      "author", "license", "urls", "host_application", "sdk",
+                      "capabilities", "i18n"]
+          errors += [f"缺少必需字段: {k}" for k in required if k not in m]
+
+          if m.get("manifest_version") != 2:
+              errors.append(f"manifest_version 必须为 2，实际 {m.get('manifest_version')!r}")
+
+          # 插件 ID 格式: aaa.bbb 或 aaa-bbb
+          pid = m.get("id", "")
+          if not re.fullmatch(r"[A-Za-z0-9_]+(?:[.-][A-Za-z0-9_]+)+", pid):
+              errors.append(f"插件 ID 格式不合法: {pid!r}")
+
+          # 三段式版本
+          for label, val in [("version", m.get("version"))]:
+              if not (isinstance(val, str) and re.fullmatch(r"\d+\.\d+\.\d+", val)):
+                  errors.append(f"{label} 必须是三段式数字版本: {val!r}")
+
+          for block in ("host_application", "sdk"):
+              sub = m.get(block, {})
+              for key in ("min_version", "max_version"):
+                  val = sub.get(key)
+                  if not (isinstance(val, str) and re.fullmatch(r"\d+\.\d+\.\d+", val)):
+                      errors.append(f"{block}.{key} 必须是三段式版本: {val!r}")
+
+          author = m.get("author", {})
+          if not isinstance(author, dict) or not author.get("name"):
+              errors.append("author.name 缺失")
+
+          repo = m.get("urls", {}).get("repository", "")
+          if not repo.startswith("https://github.com/"):
+              errors.append(f"urls.repository 必须是公开 GitHub HTTPS 地址: {repo!r}")
+
+          caps = m.get("capabilities")
+          if not isinstance(caps, list) or not caps:
+              errors.append("capabilities 必须是非空列表")
+
+          if errors:
+              print("manifest 校验失败：")
+              for e in errors:
+                  print("  -", e)
+              sys.exit(1)
+
+          print(f"manifest OK: {pid} v{m['version']} ({len(caps)} 个能力)")
+          PY
+
+      - name: Guard against committed secrets or private assets
+        run: |
+          set -e
+          if git ls-files --error-unmatch config.toml >/dev/null 2>&1; then
+            echo "::error::config.toml 被提交了，其中含 API Key"
+            exit 1
+          fi
+          if git ls-files 'voices/*' | grep -v '\.gitkeep$' | grep -q .; then
+            echo "::error::voices/ 下的音色文件被提交了"
+            exit 1
+          fi
+          if git grep -nIE 'sk-[A-Za-z0-9]{16,}' -- ':!CHANGELOG.md' ':!README.md'; then
+            echo "::error::疑似 API Key 泄漏"
+            exit 1
+          fi
+          echo "没有误提交的配置、音色或密钥"
