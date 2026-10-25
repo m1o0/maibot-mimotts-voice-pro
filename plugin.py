@@ -115,7 +115,7 @@ class VoiceSectionConfig(PluginConfigBase):
     voices_dir: str = Field(default="voices", description="音色目录路径（相对于插件目录）")
     default_voice: str = Field(default="", description="默认音色名称（clone模式下为音频文件名）")
     clone_voice: str = Field(default="", description="复刻音色文件名（clone模式下优先使用）")
-    audio_format: str = Field(default="wav", description="合成音频格式：wav / mp3 / pcm16（mp3 体积最小）")
+    audio_format: str = Field(default="mp3", description="合成音频格式：wav / mp3 / pcm / pcm16（mp3 体积约 wav 的 1/6）")
 
 
 class RequestSectionConfig(PluginConfigBase):
@@ -562,13 +562,13 @@ class AIVoicePlugin(MaiBotPlugin):
         if not voice_key:
             return {"success": False, "error": "No voice configured. Check voice config."}
 
-        audio_format = (self.config.voice.audio_format or "wav").strip().lower()
+        audio_format = (self.config.voice.audio_format or "mp3").strip().lower()
         if audio_format not in MiMoTTSService.SUPPORTED_FORMATS:
             self.ctx.logger.warning(
-                "不支持的 audio_format=%r，回退到 wav（支持：%s）",
+                "不支持的 audio_format=%r，回退到 mp3（支持：%s）",
                 audio_format, ", ".join(MiMoTTSService.SUPPORTED_FORMATS),
             )
-            audio_format = "wav"
+            audio_format = "mp3"
 
         self.ctx.logger.info("TTS request: mode=%s, voice_key=%s, text_len=%d, style_len=%d, format=%s",
             mode, voice_key, len(text), len(style_instruction), audio_format)
