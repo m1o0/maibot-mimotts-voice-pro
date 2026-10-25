@@ -2,6 +2,16 @@
 
 本文件记录插件各版本的变化。遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.9.8] - 2026-10-25
+
+### 修复
+
+- **README「对外接口」示例里残留上游插件 ID**。示例写的是
+  `plugin_call("Emilia-awa.maibot-mimotts-voice", ...)`，那是原版插件的 ID；
+  本插件是 `m1o0.maibot-mimotts-voice-pro`，照抄示例的调用方会调到原版去 ——
+  两个插件装的配置、音色目录、API Key 都不一样，调错了不报错，只是安静地走错地方。
+  现改为本插件 ID。
+
 ## [1.9.7] - 2026-10-25
 
 ### 修复
