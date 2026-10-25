@@ -399,8 +399,18 @@ class AIVoicePlugin(MaiBotPlugin):
         # 这里必须用 get_all_streams 而不是 get_group_streams：后者只返回群聊，
         # 在「1 个群 + 若干私聊」的环境里 len==1 也会成立，于是私聊消息会拿到
         # 那个唯一的群流 —— 正是我们要防的串流。只看全量会话数才能确认没猜错。
+        #
+        # platform 必须显式传：SDK 给这些方法定的默认值是 "qq"，宿主的
+        # `_list_sessions()` 会按平台过滤。多平台部署时若用默认值，只会数到 QQ
+        # 会话 —— 别的平台上明明还有会话却数出「只有 1 个」，兜底就猜错了。
+        #
+        # 拿不到 platform 时传 "all_platforms" 这个宿主约定的通配值（见
+        # `_list_sessions` 里 `platform == "all_platforms" or session.platform == platform`）。
+        # 注意不能传空串：空串只会匹配 platform 为空的会话，等于一个都查不到。
+        # 查全平台是更保守的选择 —— 会话数只会多不会少，宁可放弃发送也不发错地方。
+        platform = str(kwargs.get("platform") or "").strip() or "all_platforms"
         try:
-            all_streams = await self.ctx.chat.get_all_streams() or []
+            all_streams = await self.ctx.chat.get_all_streams(platform=platform) or []
             if len(all_streams) == 1 and isinstance(all_streams[0], dict):
                 sid = all_streams[0].get("stream_id", "")
                 if sid:
