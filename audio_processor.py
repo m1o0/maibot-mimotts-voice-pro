@@ -130,12 +130,14 @@ class AudioProcessor:
         # 配置项既可以是命令名（走 PATH），也可以是绝对/相对路径。
         # 只有带路径分隔符或盘符时才当文件检查，避免把裸命令名误判成工作目录里的同名文件。
         looks_like_path = any(sep in configured for sep in (os.sep, "/", "\\")) or Path(configured).is_absolute()
+        configured_missing = False
         if looks_like_path:
             expanded = Path(configured).expanduser()
             if expanded.is_file():
                 candidates.append(str(expanded))
             else:
-                self.logger.warning("配置的 ffmpeg 路径不存在: %s，将回退到 PATH 查找", configured)
+                configured_missing = True
+                self.logger.warning("配置的 ffmpeg 路径不存在: %s，将在 PATH 里找", configured)
 
         found = shutil.which(configured)
         if found:
@@ -152,7 +154,16 @@ class AudioProcessor:
                     break
 
         self._ffmpeg = candidates[0] if candidates else None
-        if not self._ffmpeg and not self._warned_unavailable:
+        if self._ffmpeg and configured_missing:
+            # 用户明确配了一个路径却不存在，回退成功后必须点明实际用的是哪个：
+            # 否则他会以为自己配置的那个 ffmpeg 生效了（可能是另一个版本、
+            # 甚至另一个程序的同名可执行文件），出问题时排查不到这里。
+            self.logger.warning(
+                "audio.ffmpeg_path 配置的 %r 不存在，实际改用 PATH 里的: %s"
+                "（如需固定版本请把该配置改成正确的路径）",
+                configured, self._ffmpeg,
+            )
+        elif not self._ffmpeg and not self._warned_unavailable:
             self._warned_unavailable = True
             self.logger.warning(
                 "已配置音频处理但找不到 ffmpeg（当前路径: %r），本次将跳过音频处理。"
