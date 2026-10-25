@@ -1,0 +1,536 @@
+"""插件功能验证：用桩对象模拟宿主，不连真实 MaiBot。
+
+覆盖：
+1. 配置模型解析（新配置段）
+2. _find_stream_id 四种场景（防串群）
+3. _stream_id_from_message 字段提取
+4. _fallback_to_text 各种降级分支
+5. TTS 重试 / 超时 / 非重试状态码
+6. _load_voices 清空旧音色
+"""
+import asyncio
+import os
+import sys
+import types
+from pathlib import Path
+
+# 默认测仓库里的代码（插件在 tests/ 的上一级）；设 TTS_PLUGIN_DIR 可指向运行目录
+PLUGIN_DIR = Path(os.environ.get("TTS_PLUGIN_DIR") or Path(__file__).resolve().parent.parent)
+sys.path.insert(0, str(PLUGIN_DIR))
+
+import plugin as P
+import tts_service as T
+
+
+def _set_config(p, cfg):
+    """插件 config 是只读 property，直接写私有字段。"""
+    p._plugin_config_instance = cfg
+
+PASS, FAIL = [], []
+
+
+def check(name, cond, detail=""):
+    (PASS if cond else FAIL).append(name)
+    print(f"{'✅' if cond else '❌'} {name}" + (f"  {detail}" if detail and not cond else ""))
+
+
+class FakeLogger:
+    def __init__(self):
+        self.lines = []
+
+    def _rec(self, lvl):
+        def fn(msg, *a):
+            try:
+                self.lines.append(f"[{lvl}] " + (msg % a if a else str(msg)))
+            except Exception:
+                self.lines.append(f"[{lvl}] {msg} {a}")
+        return fn
+
+    def __getattr__(self, item):
+        return self._rec(item)
+
+    def text(self):
+        return "\n".join(self.lines)
+
+
+# ---------------- 1. 配置模型 ----------------
+def test_config():
+    print("\n=== 1. 配置模型 ===")
+    cfg = P.VoicePluginConfig()
+    check("默认 request_timeout", cfg.request.request_timeout == 45.0)
+    check("默认 max_retries", cfg.request.max_retries == 2)
+    check("默认 max_concurrency", cfg.request.max_concurrency == 1)
+    check("默认 fallback_to_text", cfg.fallback.fallback_to_text is True)
+    check("默认 audio_format", cfg.voice.audio_format == "mp3")
+
+    cfg2 = P.VoicePluginConfig(
+        request={"request_timeout": 30, "max_retries": 0, "max_concurrency": 1},
+        fallback={"fallback_to_text": False, "empty_text_placeholder": ""},
+        voice={"voice_mode": "preset", "audio_format": "mp3"},
+    )
+    check("覆盖 request_timeout", cfg2.request.request_timeout == 30)
+    check("覆盖 max_retries", cfg2.request.max_retries == 0)
+    check("覆盖 fallback_to_text", cfg2.fallback.fallback_to_text is False)
+    check("覆盖 audio_format", cfg2.voice.audio_format == "mp3")
+
+
+# ---------------- 2. _find_stream_id ----------------
+def make_plugin():
+    p = object.__new__(P.AIVoicePlugin)
+    p.tts_service = None
+    p.voices = {}
+    p.default_voice = "luoxi"
+    p._voice_inflight = set()
+    p._background_tasks = set()
+    p._ctx = types.SimpleNamespace(logger=FakeLogger())
+    return p
+
+
+class FakeMessage:
+    def __init__(self, payload):
+        self.payload = payload
+
+    async def get_by_id(self, message_id, **kw):
+        return self.payload
+
+
+class FakeChat:
+    def __init__(self, streams):
+        self.streams = streams
+        self.calls = 0
+
+    async def get_all_streams(self, platform="qq"):
+        self.calls += 1
+        return self.streams
+
+    async def get_group_streams(self, platform="qq"):
+        self.calls += 1
+        return [s for s in self.streams if s.get("is_group_session")]
+
+
+async def test_find_stream():
+    print("\n=== 2. _find_stream_id（防串群）===")
+    p = make_plugin()
+
+    # 2.1 kwargs 直接给出
+    sid = await p._find_stream_id({"stream_id": "SID_FROM_KW"}, msg_id="m1")
+    check("kwargs.stream_id 优先", sid == "SID_FROM_KW", sid)
+
+    # 2.2 chat_id 兜底
+    sid = await p._find_stream_id({"chat_id": "SID_FROM_CHAT"}, msg_id="m1")
+    check("kwargs.chat_id 次之", sid == "SID_FROM_CHAT", sid)
+
+    # 2.3 session_id 兜底
+    sid = await p._find_stream_id({"session_id": "SID_FROM_SESS"}, msg_id="m1")
+    check("kwargs.session_id 第三", sid == "SID_FROM_SESS", sid)
+
+    # 2.4 靠 msg_id 反查
+    p.ctx.message = FakeMessage({"session_id": "SID_FROM_MSG"})
+    p.ctx.chat = FakeChat([{"stream_id": "GROUP_A"}, {"stream_id": "GROUP_B"}])
+    sid = await p._find_stream_id({}, msg_id="m42")
+    check("msg_id 反查成功", sid == "SID_FROM_MSG", sid)
+    check("反查命中时不调用群列表兜底", p.ctx.chat.calls == 0, f"calls={p.ctx.chat.calls}")
+
+    # 2.5 反查失败 + 多个会话 → 拒绝兜底（关键：不串群/不串私聊）
+    p.ctx.message = FakeMessage(None)
+    p.ctx.chat = FakeChat([{"stream_id": "GROUP_A"}, {"stream_id": "GROUP_B"}])
+    sid = await p._find_stream_id({}, msg_id="")
+    check("多会话时不乱发（返回空）", sid == "", sid)
+    check("多会话时报 error 日志", "放弃语音发送" in p.ctx.logger.text(), p.ctx.logger.text()[-200:])
+
+    # 2.6 反查失败 + 全局只有一个会话 → 允许兜底
+    p.ctx.chat = FakeChat([{"stream_id": "ONLY_GROUP", "is_group_session": True}])
+    sid = await p._find_stream_id({}, msg_id="")
+    check("全局单会话时兜底可用", sid == "ONLY_GROUP", sid)
+
+    # 2.6b 1 个群 + 1 个私聊：旧实现用 get_group_streams 会数出 1 个群
+    #      而错误地把私聊消息发到那个群里，这里必须拒绝
+    p.ctx.message = FakeMessage(None)
+    p.ctx.chat = FakeChat([
+        {"stream_id": "GROUP_A", "is_group_session": True},
+        {"stream_id": "PRIVATE_B", "is_group_session": False},
+    ])
+    sid = await p._find_stream_id({}, msg_id="")
+    check("1群+1私聊时不串流（返回空）", sid == "", sid)
+
+    # 2.7 反查抛异常 → 不崩
+    class Boom:
+        async def get_by_id(self, *a, **k):
+            raise RuntimeError("boom")
+    p.ctx.message = Boom()
+    p.ctx.chat = FakeChat([{"stream_id": "ONLY_GROUP", "is_group_session": True}])
+    sid = await p._find_stream_id({}, msg_id="m9")
+    check("反查异常不崩溃", sid == "ONLY_GROUP", sid)
+
+    # 2.8 完全没有消息源
+    p.ctx.chat = FakeChat([])
+    sid = await p._find_stream_id({}, msg_id="")
+    check("无任何信息时返回空", sid == "", sid)
+
+
+# ---------------- 3. _stream_id_from_message ----------------
+def test_stream_extract():
+    print("\n=== 3. _stream_id_from_message ===")
+    f = P.AIVoicePlugin._stream_id_from_message
+    check("顶层 session_id", f({"session_id": "A"}) == "A")
+    check("顶层 stream_id", f({"stream_id": "B"}) == "B")
+    check("顶层 chat_id", f({"chat_id": "C"}) == "C")
+    check("message_info 内", f({"message_info": {"stream_id": "D"}}) == "D")
+    check("非 dict 返回空", f(None) == "" and f("x") == "")
+    check("空 dict 返回空", f({}) == "")
+    check("优先 session_id", f({"session_id": "S", "stream_id": "T"}) == "S")
+
+
+# ---------------- 4. _fallback_to_text ----------------
+class FakeSend:
+    def __init__(self, ok=True, raise_exc=False):
+        self.sent = []
+        self.ok = ok
+        self.raise_exc = raise_exc
+
+    async def text(self, text, stream_id, **kw):
+        if self.raise_exc:
+            raise RuntimeError("send boom")
+        self.sent.append((text, stream_id))
+        return self.ok
+
+
+async def test_fallback():
+    print("\n=== 4. _fallback_to_text ===")
+    p = make_plugin()
+    _set_config(p, P.VoicePluginConfig())
+
+    # 4.1 剥标签
+    p.ctx.send = FakeSend()
+    await p._fallback_to_text("宝宝~ 我在呢（轻笑）", "s1")
+    check("剥掉音频标签", p.ctx.send.sent and p.ctx.send.sent[0][0] == "宝宝~ 我在呢", str(p.ctx.send.sent))
+
+    # 4.2 英文标签
+    p.ctx.send = FakeSend()
+    await p._fallback_to_text("(sighs) I don't know.", "s1")
+    check("剥掉英文标签", p.ctx.send.sent[0][0] == "I don't know.", str(p.ctx.send.sent))
+
+    # 4.3 全是标签 → 用兜底文案
+    p.ctx.send = FakeSend()
+    await p._fallback_to_text("（轻笑）（叹气）", "s1")
+    check("空正文用兜底文案", p.ctx.send.sent and p.ctx.send.sent[0][0] == "（想说点什么，但声音没发出来）", str(p.ctx.send.sent))
+
+    # 4.4 兜底文案也留空 → 不发
+    _set_config(p, P.VoicePluginConfig(fallback={"empty_text_placeholder": ""}))
+    p.ctx.send = FakeSend()
+    await p._fallback_to_text("（轻笑）", "s1")
+    check("兜底文案留空则不发", p.ctx.send.sent == [], str(p.ctx.send.sent))
+
+    # 4.5 关闭降级 → 完全不发
+    _set_config(p, P.VoicePluginConfig(fallback={"fallback_to_text": False}))
+    p.ctx.send = FakeSend()
+    await p._fallback_to_text("正文", "s1")
+    check("关闭降级后不发", p.ctx.send.sent == [], str(p.ctx.send.sent))
+
+    # 4.6 关闭剥标签 → 原样发
+    _set_config(p, P.VoicePluginConfig(fallback={"strip_audio_tags": False}))
+    p.ctx.send = FakeSend()
+    await p._fallback_to_text("宝宝（轻笑）", "s1")
+    check("关闭剥标签则原样发", p.ctx.send.sent[0][0] == "宝宝（轻笑）", str(p.ctx.send.sent))
+
+    # 4.7 发送异常不崩
+    _set_config(p, P.VoicePluginConfig())
+    p.ctx.send = FakeSend(raise_exc=True)
+    try:
+        await p._fallback_to_text("正文", "s1")
+        check("发送异常被吞掉不崩溃", True)
+    except Exception as e:
+        check("发送异常被吞掉不崩溃", False, repr(e))
+
+
+# ---------------- 5. TTS 重试 / 超时 ----------------
+async def test_tts():
+    print("\n=== 5. TTS 重试 / 超时 ===")
+    svc = T.MiMoTTSService("key", logger=FakeLogger(), max_retries=2, retry_backoff=0)
+    check("max_retries 生效", svc.max_retries == 2)
+    check("request_timeout 生效", svc.request_timeout == 45.0)
+    check("SUPPORTED_FORMATS 含 pcm16", "pcm16" in svc.SUPPORTED_FORMATS)
+
+    svc._update_limits(request_timeout=12, connect_timeout=10, max_retries=0, retry_backoff=1.5, max_concurrency=1)
+    check("apply_settings 生效", svc.request_timeout == 12 and svc.max_retries == 0 and svc._max_concurrency == 1)
+
+    # 空 key 直接失败，不发请求
+    svc2 = T.MiMoTTSService("", logger=FakeLogger())
+    r = await svc2._do_request({"messages": [{"content": "x"}]}, {})
+    check("无 key 时快速失败", r["success"] is False and "API Key" in r["error"], str(r))
+
+    # 模拟 _get_session 返回会抛超时的 session
+    class FakeResp:
+        def __init__(self, status, body="", payload=None):
+            self.status = status
+            self._body = body
+            self._payload = payload or {}
+
+        async def text(self):
+            return self._body
+
+        async def json(self):
+            return self._payload
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class FakeSession:
+        def __init__(self, responses, exc=None):
+            self.responses = responses
+            self.exc = exc
+            self.n = 0
+
+        def post(self, *a, **kw):
+            if self.exc:
+                raise self.exc
+            r = self.responses[min(self.n, len(self.responses) - 1)]
+            self.n += 1
+            return r
+
+    async def run_with(session, retries=2):
+        s = T.MiMoTTSService("k", logger=FakeLogger(), max_retries=retries, retry_backoff=0)
+        s._session = session
+        async def _get():
+            return session
+        s._get_session = _get
+        payload = {"messages": [{"role": "assistant", "content": "hi"}]}
+        return await s._do_request(payload, {})
+
+    # 5.1 429 → 重试后成功
+    s = FakeSession([FakeResp(429, "too many"), FakeResp(200, payload={"choices": [{"message": {"audio": {"data": "AAA"}}}]})])
+    r = await run_with(s, retries=2)
+    check("429 后重试成功", r["success"] is True and r.get("audio_base64") == "AAA", str(r))
+    check("429 触发 2 次请求", s.n == 2, f"n={s.n}")
+
+    # 5.2 400 不可重试 → 立即失败
+    s = FakeSession([FakeResp(400, "bad request")])
+    r = await run_with(s, retries=2)
+    check("400 不重试", r["success"] is False and s.n == 1, f"n={s.n} {r}")
+
+    # 5.3 全部 500 → 重试耗尽后失败
+    s = FakeSession([FakeResp(503, "unavail")])
+    r = await run_with(s, retries=1)
+    check("503 重试耗尽后失败", r["success"] is False, str(r))
+    check("503 共 2 次请求（1+retry1）", s.n == 2, f"n={s.n}")
+
+    # 5.4 超时不重试 → 只发 1 次
+    class TimeoutSession(FakeSession):
+        def post(self, *a, **kw):
+            self.n += 1
+            raise asyncio.TimeoutError()
+
+    s = TimeoutSession([])
+    r = await run_with(s, retries=3)
+    check("超时不重试（只 1 次）", s.n == 1, f"n={s.n}")
+    check("超时错误信息含超时秒数", "timeout after" in r.get("error", ""), str(r))
+
+    # 5.5 成功但无 audio
+    s = FakeSession([FakeResp(200, payload={"choices": [{"message": {}}]})])
+    r = await run_with(s, retries=0)
+    check("无 audio 时失败", r["success"] is False and "No audio" in r["error"], str(r))
+
+    # 5.6 非法 JSON
+    class BadJson(FakeResp):
+        async def json(self):
+            raise ValueError("not json")
+    s = FakeSession([BadJson(200)])
+    r = await run_with(s, retries=0)
+    check("非法 JSON 被捕获", r["success"] is False and "invalid response" in r["error"], str(r))
+
+
+# ---------------- 6. _load_voices 清空旧音色 ----------------
+async def test_load_voices():
+    print("\n=== 6. _load_voices 清理 ===")
+    p = make_plugin()
+    _set_config(p, P.VoicePluginConfig(voice={"voices_dir": "voices"}))
+    p.voices = {"stale_voice": "data:audio/wav;base64,OLD"}
+    await p._load_voices()
+    check("重载后不含上传前残留的旧音色", "stale_voice" not in p.voices, str(list(p.voices.keys())))
+    # 仓库里不带 voices/（被 .gitignore 排除，音色由用户自己放），
+    # 所以这条只在运行目录下跑测试时才断真实文件，仓库里只断言「不崩且清掉了旧音色」。
+    if (PLUGIN_DIR / "voices" / "luoxi.mp3").is_file():
+        check("加载到真实音色 luoxi", "luoxi" in p.voices, str(list(p.voices.keys())))
+        if "luoxi" in p.voices:
+            check("音色带 data URI 前缀", p.voices["luoxi"].startswith("data:audio/"), p.voices["luoxi"][:40])
+    else:
+        print("  ⏭  跳过 luoxi 真实音色断言（当前目录没有 voices/luoxi.mp3）")
+
+    # 指向不存在的目录 → 清空且不崩
+    _set_config(p, P.VoicePluginConfig(voice={"voices_dir": "__no_such_dir__"}))
+    await p._load_voices()
+    check("目录不存在时清空音色", p.voices == {}, str(p.voices))
+    # 清理掉测试建的目录
+    d = PLUGIN_DIR / "__no_such_dir__"
+    if d.exists():
+        try:
+            d.rmdir()
+        except OSError:
+            pass
+
+
+# ---------------- 7. _resolve_voice ----------------
+def test_resolve_voice():
+    print("\n=== 7. _resolve_voice ===")
+    p = make_plugin()
+    p.voices = {"luoxi": "data:audio/mpeg;base64,X", "other": "data:audio/mpeg;base64,Y"}
+    p.default_voice = "luoxi"
+    _set_config(p, P.VoicePluginConfig(voice={"voice_mode": "clone", "clone_voice": "other"}))
+
+    key, audio, mode = p._resolve_voice("")
+    check("空名用 default_voice", key == "luoxi" and mode == "clone", f"{key},{mode}")
+
+    key, audio, mode = p._resolve_voice("default")
+    check("'default' 用 default_voice", key == "luoxi", key)
+
+    key, audio, mode = p._resolve_voice("other")
+    check("指定存在的音色", key == "other", key)
+
+    key, audio, mode = p._resolve_voice("ghost")
+    check("不存在则回退 clone_voice", key == "other", key)
+
+    p.voices = {}
+    key, audio, mode = p._resolve_voice("anything")
+    check("无音色时返回空", key == "" and mode == "", f"{key},{mode}")
+
+    p.voices = {"luoxi": "x"}
+    _set_config(p, P.VoicePluginConfig(voice={"voice_mode": "preset", "preset_voice": "冰糖"}))
+    key, audio, mode = p._resolve_voice("")
+    check("preset 模式返回预置名", key == "冰糖" and mode == "preset", f"{key},{mode}")
+
+
+# ---------------- 8. audio_format 校验 ----------------
+async def test_audio_format():
+    print("\n=== 8. audio_format 校验 ===")
+    p = make_plugin()
+    _set_config(p, P.VoicePluginConfig(voice={"voice_mode": "clone", "audio_format": "opus"}))
+    p.voices = {"luoxi": "data:audio/mpeg;base64,X"}
+    p.default_voice = "luoxi"
+
+    captured = {}
+
+    class FakeTTS:
+        async def synthesize_with_voice_clone(self, **kw):
+            captured.update(kw)
+            return {"success": False, "error": "stub"}
+
+        async def synthesize_with_preset(self, **kw):
+            captured.update(kw)
+            return {"success": False, "error": "stub"}
+
+    p.tts_service = FakeTTS()
+    await p.voice_clone_tts("你好", "", "s1", "")
+    check("非法格式回退 mp3", captured.get("audio_format") == "mp3", str(captured.get("audio_format")))
+    check("非法格式有 warning", "不支持的 audio_format" in p.ctx.logger.text(), p.ctx.logger.text()[-200:])
+
+    _set_config(p, P.VoicePluginConfig(voice={"voice_mode": "clone", "audio_format": "mp3"}))
+    captured.clear()
+    await p.voice_clone_tts("你好", "", "s1", "")
+    check("合法格式 mp3 透传", captured.get("audio_format") == "mp3", str(captured.get("audio_format")))
+
+
+# ---------------- 9. 并发保护 ----------------
+async def test_inflight():
+    print("\n=== 9. 并发保护 ===")
+    p = make_plugin()
+    _set_config(p, P.VoicePluginConfig())
+    p.ctx.send = FakeSend()
+    called = {"tts": 0}
+
+    async def slow_tts(**kw):
+        called["tts"] += 1
+        await asyncio.sleep(0.2)
+        return {"success": True}
+
+    p.voice_clone_tts = slow_tts
+    t1 = asyncio.create_task(p._async_voice_reply("第一句", "", "same_stream", ""))
+    await asyncio.sleep(0.05)
+    await p._async_voice_reply("第二句", "", "same_stream", "")
+    check("忙碌时第二句走文字降级", len(p.ctx.send.sent) == 1 and p.ctx.send.sent[0][0] == "第二句", str(p.ctx.send.sent))
+    await t1
+    check("忙碌时只调 1 次 TTS", called["tts"] == 1, str(called))
+
+    # 关闭 skip_when_busy → 允许并发
+    _set_config(p, P.VoicePluginConfig(fallback={"skip_when_busy": False}))
+    called["tts"] = 0
+    p.ctx.send = FakeSend()
+    t1 = asyncio.create_task(p._async_voice_reply("A", "", "s2", ""))
+    await asyncio.sleep(0.05)
+    t2 = asyncio.create_task(p._async_voice_reply("B", "", "s2", ""))
+    await asyncio.gather(t1, t2)
+    check("关闭 skip_when_busy 后允许并发", called["tts"] == 2, str(called))
+
+    # 结束后 inflight 被清理
+    check("inflight 已清理", "s2" not in p._voice_inflight, str(p._voice_inflight))
+
+
+# ---------------- 10. 工具返回值 ----------------
+
+async def test_tool_result():
+    print("\n=== 10. send_voice_reply 返回值（模型可读的 content）===")
+    # 模型读的是返回 dict 的 content 字段。返回空或只有结构化字段时，
+    # 模型会以为调用失败，然后拿同样内容再 reply 一遍，和「语音顶替
+    # 本次文字回复」的设计打架。
+
+    p = make_plugin()
+    p._voice_inflight = set()
+
+    async def fake_find(kwargs, msg_id=""):
+        return "SID_OK"
+
+    async def fake_async(*a, **k):
+        return None
+
+    p._find_stream_id = fake_find
+    p._async_voice_reply = fake_async
+
+    r = await p.send_voice_reply("你好呀", msg_id="m1")
+    check("成功 success=True", r.get("success") is True, str(r))
+    check("成功返回 content", bool(r.get("content")), str(r))
+    check("content 提示不要重复发", "不需要再用 reply" in r.get("content", ""), str(r))
+
+    # 找不到聊天流时也要有可读的 content
+    async def fake_find_empty(kwargs, msg_id=""):
+        return ""
+
+    p._find_stream_id = fake_find_empty
+    r = await p.send_voice_reply("你好呀", msg_id="m1")
+    check("失败 success=False", r.get("success") is False, str(r))
+    check("失败返回 content", bool(r.get("content")), str(r))
+
+    # reply_text 为空
+    p._find_stream_id = fake_find
+    r = await p.send_voice_reply("   ", msg_id="m1")
+    check("空文本有 content", bool(r.get("content")), str(r))
+
+
+async def main():
+    test_config()
+    await test_find_stream()
+    test_stream_extract()
+    await test_fallback()
+    await test_tts()
+    await test_load_voices()
+    test_resolve_voice()
+    await test_audio_format()
+    await test_inflight()
+    await test_tool_result()
+
+    print("\n" + "=" * 50)
+    print(f"通过 {len(PASS)} 项，失败 {len(FAIL)} 项")
+    if FAIL:
+        print("失败项：")
+        for f in FAIL:
+            print("  -", f)
+        return 1
+    print("全部通过 ✅")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()))
+
+

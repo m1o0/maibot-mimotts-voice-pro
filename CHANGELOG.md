@@ -2,6 +2,25 @@
 
 本文件记录插件各版本的变化。遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.9.9] - 2026-10-25
+
+### 新增
+
+- **仓库内可跑的回归测试** `tests/test_plugin.py`（69 项）。用桩对象模拟宿主，
+  不连真实 MaiBot、不打真实 API，覆盖配置解析、聊天流定位（含多群防串流）、
+  TTS 重试与超时分类、文字降级、音色清理、并发保护、工具返回值。
+  `python tests/test_plugin.py` 直接跑，退出码可用于 CI。
+  设 `TTS_PLUGIN_DIR` 环境变量可指向实际部署目录做现场验证（此时会额外
+  校验 `voices/` 里的真实音色，共 71 项）。
+
+### 修复
+
+- `_find_stream_id` 里的局部变量 `resloved` 拼写改为 `resolved`。
+- `MiMoTTSService.synthesize_with_preset` / `synthesize_with_voice_clone` 的
+  `audio_format` 参数默认值仍是 `wav`，与同版本统一后的 `mp3` 不一致。
+  这两个默认值实际不会被走到（调用方总是显式传参），但留着会误导后续改动者，
+  一并改为 `mp3`。
+
 ## [1.9.8] - 2026-10-25
 
 ### 修复

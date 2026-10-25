@@ -90,7 +90,7 @@ class MiMoTTSService:
         text: str,
         voice_id: str = "mimo_default",
         style_instruction: str = "",
-        audio_format: str = "wav",
+        audio_format: str = "mp3",
     ) -> dict[str, Any]:
         """使用预置音色合成语音"""
         if not self.api_key:
@@ -128,7 +128,7 @@ class MiMoTTSService:
         text: str,
         reference_audio_base64: str,
         style_instruction: str = "",
-        audio_format: str = "wav",
+        audio_format: str = "mp3",
     ) -> dict[str, Any]:
         """使用音色复刻合成语音"""
         if not self.api_key:

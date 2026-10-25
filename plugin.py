@@ -387,10 +387,10 @@ class AIVoicePlugin(MaiBotPlugin):
         if msg_id:
             try:
                 message = await self.ctx.message.get_by_id(str(msg_id), include_binary_data=False)
-                resloved = self._stream_id_from_message(message)
-                if resloved:
-                    self.ctx.logger.info("Resolved stream_id from message %s: %s", msg_id, resloved)
-                    return resloved
+                resolved = self._stream_id_from_message(message)
+                if resolved:
+                    self.ctx.logger.info("Resolved stream_id from message %s: %s", msg_id, resolved)
+                    return resolved
             except Exception as e:
                 self.ctx.logger.warning("message.get_by_id failed for %s: %s", msg_id, e)
 
