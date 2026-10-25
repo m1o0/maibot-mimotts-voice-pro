@@ -115,7 +115,7 @@ class VoiceSectionConfig(PluginConfigBase):
     voices_dir: str = Field(default="voices", description="音色目录路径（相对于插件目录）")
     default_voice: str = Field(default="", description="默认音色名称（clone模式下为音频文件名）")
     clone_voice: str = Field(default="", description="复刻音色文件名（clone模式下优先使用）")
-    audio_format: str = Field(default="mp3", description="合成音频格式：wav / mp3 / pcm / pcm16（mp3 体积约 wav 的 1/6）")
+    audio_format: str = Field(default="wav", description="合成音频格式：wav / mp3 / pcm / pcm16（mp3 体积约 wav 的 1/6）")
 
 
 class RequestSectionConfig(PluginConfigBase):
