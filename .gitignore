@@ -24,6 +24,10 @@ env/
 Thumbs.db
 
 # 本地调试产物
+# 注意 *.log 不会匹配 *.log.jsonl —— 导入宿主的 src 模块做测试时，
+# 它的日志系统会按当前工作目录创建 logs/ 并写这种带日期后缀的文件。
 *.log
+*.log.jsonl
+logs/
 *.bak
 *.bak-*
