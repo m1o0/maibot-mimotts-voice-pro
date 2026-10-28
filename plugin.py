@@ -331,37 +331,70 @@ class AIVoicePlugin(MaiBotPlugin):
         voices_dir = self._resolve_voices_dir(plugin_dir)
         self.ctx.logger.info("Loading voices from: %s (plugin_dir=%s)", voices_dir, plugin_dir)
 
-        # 重新扫描前先清空：原实现只在「找到音频文件」时才 clear，
-        # 把 voices 目录里的文件全删掉后热重载，旧音色仍会被继续引用。
-        self.voices.clear()
+        # 不在函数开头 clear：若中途读某个文件失败，旧音色已被清空、新音色
+        # 又只加载了一半，热重载反而让插件比之前更不可用。改为先构建新字典，
+        # 确定走完后整体替换（目录不存在/无音频文件时同样替换成空字典，
+        # 这样「把 voices 里的文件全删掉」依然能让旧音色失效）。
+        loaded: dict[str, str] = {}
 
         if not voices_dir.exists():
             # 不在这里 mkdir：插件只应往 data_dir / runtime_dir 写，
             # 在源码目录里建空文件夹既会被 .gitignore 吞掉，也让用户以为
             # 放进去的文件会被同步。直接告诉他该建哪个目录即可。
+            self.voices = loaded
             self.ctx.logger.warning(
                 "音色目录不存在: %s，请先创建它并把 .wav/.mp3 参考音频放进去", voices_dir
             )
             return
 
-        self.ctx.logger.info("Voices dir exists: %s, contents: %s", voices_dir, [f.name for f in voices_dir.iterdir()])
+        # 目录列举同样可能抛 OSError（权限不足、路径是个文件、网盘占位符
+        # 无法访问等），和读文件失败属于同一类风险：未捕获就会让整个插件
+        # 在 on_load 阶段被注销。这里同样降级成「没有可用音色」。
+        try:
+            self.ctx.logger.info(
+                "Voices dir exists: %s, contents: %s", voices_dir, [f.name for f in voices_dir.iterdir()]
+            )
+            audio_files = sorted(list(voices_dir.glob("*.wav")) + list(voices_dir.glob("*.mp3")))
+        except OSError as exc:
+            self.voices = loaded
+            self.ctx.logger.warning("无法列举音色目录 %s（%s），本次不加载任何音色", voices_dir, exc)
+            return
 
-        audio_files = sorted(list(voices_dir.glob("*.wav")) + list(voices_dir.glob("*.mp3")))
         if not audio_files:
+            self.voices = loaded
             self.ctx.logger.warning("No audio files found in: %s", voices_dir)
             return
 
         for audio_file in audio_files:
             voice_name = audio_file.stem
-            file_size = audio_file.stat().st_size
-            suffix = audio_file.suffix.lower()
+            # 单个音色读不出来绝不能拖垮整个插件：本函数在 on_load 里被直接
+            # await，任何未捕获异常都会让宿主把插件注销成 FAILED
+            # （runner_main.py:1662-1666），语音功能全部消失且要重启宿主才能
+            # 恢复。而「音频被播放器独占、网盘正在同步、文件刚被改名」都是
+            # 正常运维场景，不是编码错误，只该跳过这一个音色。
+            try:
+                file_size = audio_file.stat().st_size
+                suffix = audio_file.suffix.lower()
+                with open(audio_file, "rb") as f:
+                    audio_bytes = f.read()
+            except OSError as exc:
+                self.ctx.logger.warning(
+                    "跳过无法读取的音色文件 %s（%s），其余音色继续加载",
+                    audio_file.name, exc,
+                )
+                continue
+
+            if not audio_bytes:
+                self.ctx.logger.warning("跳过空文件音色 %s（0 字节）", audio_file.name)
+                continue
+
             mime_type = "audio/wav" if suffix == ".wav" else "audio/mpeg"
-            with open(audio_file, "rb") as f:
-                audio_bytes = f.read()
             b64_data = base64.b64encode(audio_bytes).decode("ascii")
             # Store with MIME type prefix for API call
-            self.voices[voice_name] = f"data:{mime_type};base64,{b64_data}"
+            loaded[voice_name] = f"data:{mime_type};base64,{b64_data}"
             self.ctx.logger.info("Loaded voice: %s, raw=%dKB, b64=%dKB, mime=%s", voice_name, file_size // 1024, len(b64_data) // 1024, mime_type)
+
+        self.voices = loaded
 
         if not self.default_voice and self.voices:
             self.default_voice = next(iter(self.voices))

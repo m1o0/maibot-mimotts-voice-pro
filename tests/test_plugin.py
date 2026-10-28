@@ -7,10 +7,14 @@
 4. _fallback_to_text 各种降级分支
 5. TTS 重试 / 超时 / 非重试状态码
 6. _load_voices 清空旧音色
+6b. _load_voices 坏文件隔离（单个音色读不了不能拖垮整个插件）
+6c. _load_voices 失败时状态确定性
 """
 import asyncio
 import os
+import shutil
 import sys
+import tempfile
 import types
 from pathlib import Path
 
@@ -372,6 +376,93 @@ async def test_load_voices():
             pass
 
 
+# ---------------- 6b. 坏文件隔离 ----------------
+async def test_load_voices_bad_file():
+    """回归：voices/ 里有一个读不了的文件时，插件不能整个挂掉。
+
+    _load_voices 在 on_load 里被直接 await，异常上抛会让宿主把插件注销成
+    FAILED（runner_main.py:1662-1666），所有语音能力消失且要重启宿主。而
+    「音频被播放器独占、网盘同步中、文件刚被改名」都是正常运维场景。
+    """
+    print("\n=== 6b. _load_voices 坏文件隔离 ===")
+    p = make_plugin()
+
+    tmp = Path(tempfile.mkdtemp(prefix="mimotts_voices_", dir=PLUGIN_DIR))
+    try:
+        (tmp / "good.wav").write_bytes(b"RIFF" + b"\x00" * 64)
+        (tmp / "empty.mp3").write_bytes(b"")
+        (tmp / "locked.wav").write_bytes(b"RIFF" + b"\x00" * 32)
+
+        # 用「stat 就抛 PermissionError」模拟被独占/无权限的文件：
+        # 真实环境里构造不出稳定的占用时序。
+        real_stat = Path.stat
+
+        def fake_stat(self, *a, **kw):
+            if self.name == "locked.wav":
+                raise PermissionError(13, "另一个程序正在使用此文件，进程无法访问")
+            return real_stat(self, *a, **kw)
+
+        _set_config(p, P.VoicePluginConfig(voice={"voices_dir": str(tmp)}))
+        crashed = None
+        try:
+            Path.stat = fake_stat
+            await p._load_voices()
+        except Exception as exc:  # noqa: BLE001 - 任何异常都算「拖垮插件」
+            crashed = exc
+        finally:
+            Path.stat = real_stat
+
+        check("坏文件不抛异常（不拖垮 on_load）", crashed is None, repr(crashed))
+        check("正常音色仍被加载", "good" in p.voices, str(list(p.voices.keys())))
+        check("空文件被跳过", "empty" not in p.voices, str(list(p.voices.keys())))
+        check("坏文件被跳过", "locked" not in p.voices, str(list(p.voices.keys())))
+        check(
+            "加载结果带 data URI 前缀",
+            p.voices.get("good", "").startswith("data:audio/wav;base64,"),
+            p.voices.get("good", "")[:40],
+        )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------- 6c. 列举失败时状态确定性 ----------------
+async def test_load_voices_keeps_old_on_partial_failure():
+    """回归：目录列举失败时不抛异常，且状态确定（不会半新半旧）。"""
+    print("\n=== 6c. _load_voices 状态确定性 ===")
+    p = make_plugin()
+    p.voices = {"old": "data:audio/mpeg;base64,OLD"}
+
+    tmp = Path(tempfile.mkdtemp(prefix="mimotts_voices_"))
+    try:
+        (tmp / "new.wav").write_bytes(b"RIFF" + b"\x00" * 16)
+        real_iterdir = Path.iterdir
+
+        def fake_iterdir(self, *a, **kw):
+            if str(self) == str(tmp):
+                raise PermissionError(13, "拒绝访问")
+            return real_iterdir(self, *a, **kw)
+
+        _set_config(p, P.VoicePluginConfig(voice={"voices_dir": str(tmp)}))
+        crashed = None
+        try:
+            Path.iterdir = fake_iterdir
+            await p._load_voices()
+        except Exception as exc:  # noqa: BLE001
+            crashed = exc
+        finally:
+            Path.iterdir = real_iterdir
+
+        check("目录列举失败不抛异常", crashed is None, repr(crashed))
+        check(
+            "状态确定（全空或全旧，无半成品）",
+            p.voices == {} or p.voices == {"old": "data:audio/mpeg;base64,OLD"},
+            str(list(p.voices.keys())),
+        )
+        check("不存在无 data URI 的坏条目", all(v.startswith("data:audio/") for v in p.voices.values()), str(list(p.voices.keys())))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 # ---------------- 7. _resolve_voice ----------------
 def test_resolve_voice():
     print("\n=== 7. _resolve_voice ===")
@@ -514,6 +605,8 @@ async def main():
     await test_fallback()
     await test_tts()
     await test_load_voices()
+    await test_load_voices_bad_file()
+    await test_load_voices_keeps_old_on_partial_failure()
     test_resolve_voice()
     await test_audio_format()
     await test_inflight()
