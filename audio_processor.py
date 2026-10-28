@@ -97,6 +97,35 @@ def wrap_raw_pcm_to_wav(
 _SEMITONE_RATIO = 2.0 ** (1.0 / 12.0)
 
 
+def _kill_and_reap(proc: "asyncio.subprocess.Process") -> None:
+    """杀掉子进程并回收，避免留下孤儿 ffmpeg。
+
+    只在协程被取消这类「来不及正常 await」的路径上用，所以**不能** await
+    （await 会立刻被同一个 CancelledError 再打断）。这里 fire-and-forget 地
+    等它退出，退出后 asyncio 自己会回收 pid，不会变成僵尸。
+    """
+    if proc.returncode is not None:
+        return
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        # 已经退出了，没什么可杀的
+        return
+    except Exception:  # noqa: BLE001 - 收尾路径不该再抛新异常盖住 CancelledError
+        return
+    # 后台把 wait() 跑完，让 asyncio 回收进程
+    asyncio.ensure_future(_wait_quietly(proc))
+
+
+async def _wait_quietly(proc: "asyncio.subprocess.Process") -> None:
+    """等待子进程结束，吞掉所有异常（纯收尾用）。"""
+    try:
+        await proc.wait()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+
 @dataclass(frozen=True)
 class AudioOptions:
     """从配置提取出的、与音频处理相关的选项快照。"""
@@ -341,6 +370,13 @@ class AudioProcessor:
                 await proc.communicate()
                 self.logger.warning("ffmpeg 处理超时（>10s），本次跳过音频处理")
                 return audio
+            except asyncio.CancelledError:
+                # 上层（on_unload / 调用方取消）把任务掐了。这里必须自己收尾：
+                # asyncio 不会因为 task 被 cancel 就去杀子进程，不 kill 的话
+                # ffmpeg 会变成孤儿进程一直挂在系统里。处理完再把取消向上抛，
+                # 别把 CancelledError 吞掉（吞掉会让调用方以为正常完成）。
+                _kill_and_reap(proc)
+                raise
 
             if proc.returncode != 0:
                 msg = (stderr or b"").decode("utf-8", "ignore").strip()[:300]

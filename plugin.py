@@ -36,7 +36,7 @@ _AUDIO_TAG_WORDS = (
     "叹气|叹息|轻声叹|深吸气|深呼吸|吸气|呼气|"
     "哽咽|哽咽着|哭|哭泣|抽泣|忍哭|"
     "大声|低声|轻声|柔声|细声|沉声|缓声|"
-    "紧张|放松|平静|温柔|冷淡|冷漠|严肃|生气|愤怒|无奈|疑惑|惊讶|开心|悲伤|难过|兴奋|害羞|疲惫|慵懒|俏皮|活泼|低沉|磁性|沙哑|甜美|"
+    "紧张|放松|平静|温柔|冷淡|冷漠|严肃|生气|愤怒|无奈|疑惑|惊讶|开心|悲伤|难过|兴奋|害羞|疲惫|慵懒|俏皮|活泼|低沉|深沉|磁性|沙哑|甜美|"
     "咳嗽|清嗓|打哈欠|哈欠|低语|耳语|提高音量|大喊|小声|喃喃|停顿|沉默|犹豫|思索|"
     "东北话|四川话|粤语|日语|英文|唱歌|哼唱|"
     "sighs?|laughs?|chuckles?|giggles?|coughs?|yawns?|whispers?|softly|loudly|"
@@ -281,8 +281,20 @@ class AIVoicePlugin(MaiBotPlugin):
 
     async def on_unload(self) -> None:
         # 先取消还在跑的后台合成任务，否则插件卸载后协程会挂在已关闭的 session 上。
-        for task in list(self._background_tasks):
+        # 光 cancel() 不够：cancel 只是投递一个取消请求，不给协程机会响应。后台任务
+        # 里可能正卡在 audio_processor 的 ffmpeg 子进程上，不 await 的话那个进程会
+        # 变成孤儿留在系统里（预热重载几次就能堆一堆）。所以这里等它们真的结束。
+        pending = [t for t in self._background_tasks if not t.done()]
+        for task in pending:
             task.cancel()
+        if pending:
+            try:
+                # 加超时：某个协程赖着不走时不能让插件卸载卡死，等 2s 就放弃。
+                await asyncio.wait_for(
+                    asyncio.gather(*pending, return_exceptions=True), timeout=2.0
+                )
+            except asyncio.TimeoutError:
+                self.ctx.logger.warning("on_unload: %d 个后台任务未在 2s 内退出", len(pending))
         self._background_tasks.clear()
         self._voice_inflight.clear()
         if self.tts_service:
@@ -616,6 +628,11 @@ class AIVoicePlugin(MaiBotPlugin):
         ),
         version="1",
         public=True,
+        # 宿主调用插件 API 时的 RPC 超时，默认 60000ms。这里必须显式抬高：
+        # request_timeout 是用户可配的（默认 45s 且没有上界），调大后单次合成
+        # 会比 60s 还长，宿主就会在插件正干活时把它掐断。合成超时 + 音频后处理
+        # 超时（ffmpeg 10s）+ 余量，留 120s。
+        timeout_ms=120000,
     )
     async def voice_clone_tts(self, text: str, style_instruction: str = "", stream_id: str = "", voice_name: str = "") -> dict[str, Any]:
         if not self.tts_service:
@@ -650,9 +667,6 @@ class AIVoicePlugin(MaiBotPlugin):
                     text=text, voice_id=voice_key,
                     style_instruction=style_instruction, audio_format=audio_format,
                 )
-
-            # 释放参考音频引用
-            ref_audio = ""
 
             success = result.get("success")
             error = result.get("error", "")

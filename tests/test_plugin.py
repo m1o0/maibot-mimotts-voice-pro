@@ -636,6 +636,165 @@ async def test_raw_pcm_wrapped_before_send():
 
 
 
+# ---------------- 8d. API 声明了足够长的 RPC 超时 ----------------
+async def test_api_rpc_timeout_declared():
+    """回归：@API 必须显式声明 timeout_ms，且要盖得住最坏耗时。
+
+    宿主默认 RPC 超时 60s；request_timeout 是可配的且没有上界，用户调到 90s
+    时宿主会在插件正干活时把它掐断。插件必须自己声明一个够长的值。
+    """
+    print("\n=== 8d. API RPC 超时声明 ===")
+    info = getattr(P.AIVoicePlugin.voice_clone_tts, "__maibot_component_info__", None)
+    check("voice_clone_tts 有组件元信息", info is not None, "找不到 __maibot_component_info__")
+
+    meta = getattr(info, "metadata", {}) or {}
+    timeout_ms = meta.get("timeout_ms")
+    check("声明了 timeout_ms", timeout_ms is not None, str(meta))
+    if timeout_ms is not None:
+        check("timeout_ms 是正整数", isinstance(timeout_ms, int) and timeout_ms > 0, repr(timeout_ms))
+        # 宿主默认值 60000 是下限，必须比它长
+        check("timeout_ms 大于宿主默认 60s", timeout_ms > 60000, f"{timeout_ms} <= 60000")
+
+    # 语义校验：要盖得住「合成超时 + ffmpeg 后处理超时」
+    cfg = P.VoicePluginConfig()
+    worst = cfg.request.request_timeout + 10  # ffmpeg wait_for timeout=10
+    check(
+        f"默认配置最坏 {worst:.0f}s 不超 RPC 上限",
+        timeout_ms is not None and timeout_ms / 1000.0 >= worst,
+        f"{timeout_ms}ms < {worst}s",
+    )
+
+
+# ---------------- 8e. 取消时不留孤儿 ffmpeg ----------------
+class _FakeProc:
+    """假的子进程：communicate() 一直挂着，直到被 kill()。
+
+    用它替掉真 ffmpeg，能在任何平台、不需要装 ffmpeg 的前提下验证
+    「process() 被取消时到底有没有 kill 子进程」——本测试的全部意义就在这。
+    """
+
+    def __init__(self):
+        self.killed = False
+        self.returncode = None
+        self._stop = asyncio.Event()
+
+    async def communicate(self):
+        await self._stop.wait()
+        return (b"", b"")
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+        self._stop.set()
+
+    async def wait(self):
+        await self._stop.wait()
+        return self.returncode
+
+
+async def test_cancel_kills_ffmpeg():
+    """回归：任务被 cancel 时，ffmpeg 子进程必须被杀掉。
+
+    原来只处理了 asyncio.TimeoutError。task.cancel() 抛出的是 CancelledError，
+    不走那个分支，于是 proc.kill() 从未被调用——ffmpeg 变成孤儿进程留在系统里，
+    热重载几次就堆一堆。
+    """
+    print("\n=== 8e. 取消时回收 ffmpeg 子进程 ===")
+    app = A.AudioProcessor(options=A.AudioOptions(speed=1.5), logger=FakeLogger())
+
+    spawned: list[_FakeProc] = []
+
+    async def fake_spawn(*args, **kwargs):
+        proc = _FakeProc()
+        spawned.append(proc)
+        return proc
+
+    orig_spawn = A.asyncio.create_subprocess_exec
+    orig_resolve = A.AudioProcessor._resolve_ffmpeg
+    A.asyncio.create_subprocess_exec = fake_spawn
+    A.AudioProcessor._resolve_ffmpeg = lambda self: "ffmpeg"
+
+    try:
+        task = asyncio.ensure_future(app.process(b"fake audio", "mp3"))
+        await asyncio.sleep(0.05)        # 让子进程起来并卡在 communicate
+        check("子进程已启动", len(spawned) == 1, f"spawned={len(spawned)}")
+        if not spawned:
+            return
+        proc = spawned[0]
+        check("取消前子进程还活着", proc.returncode is None and not proc.killed, "")
+
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            check("取消向上传播（没被吞掉）", True)
+        else:
+            check("取消向上传播（没被吞掉）", False, "CancelledError 被吞了")
+
+        check("取消后子进程被 kill", proc.killed, "proc.kill() 从未被调用 = 孤儿进程")
+    finally:
+        A.asyncio.create_subprocess_exec = orig_spawn
+        A.AudioProcessor._resolve_ffmpeg = orig_resolve
+
+    # 已退出的进程再收尾一次不能炸
+    done = _FakeProc()
+    done.returncode = 0
+    try:
+        A._kill_and_reap(done)
+        check("对已退出进程重复收尾不抛异常", not done.killed)
+    except Exception as exc:  # noqa: BLE001
+        check("对已退出进程重复收尾不抛异常", False, repr(exc))
+
+
+# ---------------- 8f. on_unload 会等后台任务结束 ----------------
+async def test_unload_awaits_cancel():
+    """回归：on_unload 必须 await 被取消的任务，不能只 cancel() 就走。
+
+    cancel() 只是投递请求，不给协程收尾的机会——里面卡着的 ffmpeg 就会泄漏。
+    """
+    print("\n=== 8f. on_unload 等待任务收尾 ===")
+    p = make_plugin()
+    _set_config(p, P.VoicePluginConfig())
+
+    finished = {"n": 0}
+
+    async def stubborn():
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            # 模拟「取消后还要做收尾」的协程
+            await asyncio.sleep(0.05)
+            finished["n"] += 1
+            raise
+
+    t = asyncio.ensure_future(stubborn())
+    p._background_tasks = {t}
+    await asyncio.sleep(0.01)
+
+    await p.on_unload()
+
+    check("后台任务确实被取消", t.cancelled() or t.done(), str(t))
+    check("取消后的收尾代码跑完了", finished["n"] == 1, str(finished))
+    check("_background_tasks 已清空", not p._background_tasks, str(p._background_tasks))
+
+
+# ---------------- 8g. 语气标签白名单 ----------------
+def test_audio_tag_words():
+    """回归：常见语气词都要能从待合成文本里剥掉，否则会被念出来。"""
+    print("\n=== 8g. 语气标签剥离 ===")
+    # 「深沉」曾经漏在白名单外，会被原样念出来
+    for tag in ["深沉", "低沉", "无奈", "磁性", "温柔", "叹气", "轻笑"]:
+        src = f"（{tag}）我一直在想这件事。"
+        out = P._strip_audio_tags(src)
+        check(f"剥离「{tag}」", out == "我一直在想这件事。", repr(out))
+
+    # 正常括号内容必须保留（这是白名单设计的前提）
+    keep = "宝宝（明天要早起）早点睡"
+    check("普通括号内容原样保留", P._strip_audio_tags(keep) == keep, repr(P._strip_audio_tags(keep)))
+    keep2 = "第1名（2026年）"
+    check("年份括号原样保留", P._strip_audio_tags(keep2) == keep2, repr(P._strip_audio_tags(keep2)))
+
+
 # ---------------- 9. 并发保护 ----------------
 async def test_inflight():
     print("\n=== 9. 并发保护 ===")
@@ -724,6 +883,10 @@ async def main():
     await test_audio_format()
     await test_audio_base64_kept_without_stream()
     await test_raw_pcm_wrapped_before_send()
+    await test_api_rpc_timeout_declared()
+    await test_cancel_kills_ffmpeg()
+    await test_unload_awaits_cancel()
+    test_audio_tag_words()
     await test_inflight()
     await test_tool_result()
 
