@@ -11,6 +11,7 @@
 6c. _load_voices 失败时状态确定性
 """
 import asyncio
+import base64
 import os
 import shutil
 import sys
@@ -24,6 +25,7 @@ sys.path.insert(0, str(PLUGIN_DIR))
 
 import plugin as P
 import tts_service as T
+import audio_processor as A
 
 
 def _set_config(p, cfg):
@@ -523,6 +525,117 @@ async def test_audio_format():
     check("合法格式 mp3 透传", captured.get("audio_format") == "mp3", str(captured.get("audio_format")))
 
 
+# ---------------- 8b. 不传 stream_id 时必须保留 audio_base64 ----------------
+class FakeSendCustom:
+    """记录 custom 发送内容，用于断言真正发出去的音频。"""
+
+    def __init__(self, ok=True):
+        self.customs = []
+        self.ok = ok
+
+    async def custom(self, seg_type, content, stream_id, **kw):
+        self.customs.append((seg_type, content, stream_id))
+        return self.ok
+
+    async def text(self, text, stream_id, **kw):
+        return True
+
+
+async def test_audio_base64_kept_without_stream():
+    """回归：不传 stream_id 时不能把 audio_base64 删掉。
+
+    README:275 与 API 描述都承诺「不传则只合成不发送，result["audio_base64"]
+    里是原始音频」。原实现在这个分支里 pop 掉了该字段，调用方会拿到
+    {"success": True} 却没有音频——静默失败。
+    """
+    print("\n=== 8b. 不传 stream_id 保留音频 ===")
+    p = make_plugin()
+    _set_config(p, P.VoicePluginConfig(voice={"voice_mode": "clone", "audio_format": "mp3"}))
+    p.voices = {"luoxi": "data:audio/mpeg;base64,REF"}
+    p.default_voice = "luoxi"
+    p.audio_processor = None
+    p.ctx.send = FakeSendCustom()
+
+    class FakeTTS:
+        async def synthesize_with_voice_clone(self, **kw):
+            return {"success": True, "audio_base64": "QUJD"}
+
+        async def synthesize_with_preset(self, **kw):
+            return {"success": True, "audio_base64": "QUJD"}
+
+    p.tts_service = FakeTTS()
+    r = await p.voice_clone_tts("你好", "", "", "")
+    check("返回值 success=True", r.get("success") is True, str(r))
+    check("未传 stream_id 时 audio_base64 仍在", bool(r.get("audio_base64")), str(list(r.keys())))
+    check("audio_base64 是纯 base64（无 data URI 前缀）", r.get("audio_base64") == "QUJD", repr(r.get("audio_base64")))
+    check("未传 stream_id 时确实没发送", p.ctx.send.customs == [], str(p.ctx.send.customs))
+
+    # 带 data URI 前缀的返回值也要剥干净
+    class FakeTTS2:
+        async def synthesize_with_voice_clone(self, **kw):
+            return {"success": True, "audio_base64": "data:audio/mpeg;base64,QUJD"}
+
+        async def synthesize_with_preset(self, **kw):
+            return {"success": True, "audio_base64": "data:audio/mpeg;base64,QUJD"}
+
+    p.tts_service = FakeTTS2()
+    r2 = await p.voice_clone_tts("你好", "", "", "")
+    check("data URI 前缀被剥离", r2.get("audio_base64") == "QUJD", repr(r2.get("audio_base64")))
+
+
+# ---------------- 8c. 裸 PCM 发送前封装成 wav ----------------
+async def test_raw_pcm_wrapped_before_send():
+    """回归：audio_format=pcm/pcm16 时，发出去的必须是带 RIFF 头的 wav。
+
+    上游 pcm 是无头裸流，适配器只是把 base64 原样塞进 {"type":"record"}，
+    QQ 无法识别——要么发不出去要么是噪音。
+    """
+    print("\n=== 8c. 裸 PCM 发送前封 wav ===")
+    raw = b"\x00\x01" * 64  # 128 字节假 PCM
+
+    # 先单测封装函数本身
+    wrapped = A.wrap_raw_pcm_to_wav(raw)
+    check("封装后以 RIFF 开头", wrapped[:4] == b"RIFF", repr(wrapped[:4]))
+    check("封装后 WAVE 标识正确", wrapped[8:12] == b"WAVE", repr(wrapped[8:12]))
+    check("封装后长度 = 原始 + 44 字节头", len(wrapped) == len(raw) + 44, f"{len(wrapped)} vs {len(raw)}")
+    check("采样率写的是 24000", int.from_bytes(wrapped[24:28], "little") == 24000, str(int.from_bytes(wrapped[24:28], "little")))
+    check("声道数写的是 1", int.from_bytes(wrapped[22:24], "little") == 1, str(int.from_bytes(wrapped[22:24], "little")))
+    check("空输入返回空", A.wrap_raw_pcm_to_wav(b"") == b"", "")
+
+    # 再走完整链路
+    p = make_plugin()
+    _set_config(p, P.VoicePluginConfig(voice={"voice_mode": "clone", "audio_format": "pcm"}))
+    p.voices = {"luoxi": "data:audio/mpeg;base64,REF"}
+    p.default_voice = "luoxi"
+    p.audio_processor = None
+    p.ctx.send = FakeSendCustom()
+
+    class FakeTTS:
+        async def synthesize_with_voice_clone(self, **kw):
+            return {"success": True, "audio_base64": base64.b64encode(raw).decode()}
+
+        async def synthesize_with_preset(self, **kw):
+            return {"success": True, "audio_base64": base64.b64encode(raw).decode()}
+
+    p.tts_service = FakeTTS()
+    r = await p.voice_clone_tts("你好", "", "s1", "")
+    check("pcm 模式发送成功", r.get("success") is True, str(r))
+    check("确实调用了一次发送", len(p.ctx.send.customs) == 1, str(p.ctx.send.customs))
+
+    sent_b64 = p.ctx.send.customs[0][1]
+    sent_raw = base64.b64decode(sent_b64)
+    check("发出去的音频带 RIFF 头", sent_raw[:4] == b"RIFF", repr(sent_raw[:4]))
+    check("发出去的长度 = 原始 + 44", len(sent_raw) == len(raw) + 44, str(len(sent_raw)))
+
+    # mp3 不该被封装
+    p.ctx.send = FakeSendCustom()
+    _set_config(p, P.VoicePluginConfig(voice={"voice_mode": "clone", "audio_format": "mp3"}))
+    await p.voice_clone_tts("你好", "", "s1", "")
+    mp3_sent = base64.b64decode(p.ctx.send.customs[0][1])
+    check("mp3 不被封装（保持原样）", mp3_sent == raw, repr(mp3_sent[:8]))
+
+
+
 # ---------------- 9. 并发保护 ----------------
 async def test_inflight():
     print("\n=== 9. 并发保护 ===")
@@ -609,6 +722,8 @@ async def main():
     await test_load_voices_keeps_old_on_partial_failure()
     test_resolve_voice()
     await test_audio_format()
+    await test_audio_base64_kept_without_stream()
+    await test_raw_pcm_wrapped_before_send()
     await test_inflight()
     await test_tool_result()
 

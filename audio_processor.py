@@ -40,6 +40,59 @@ _DECODER_ARGS: dict[str, list[str]] = {
     "pcm16": list(_PCM_INPUT_ARGS),
 }
 
+# 裸 PCM 采样参数（上游实测 s16le / 24kHz / 单声道）。
+# 发送给 QQ 前要先封装成 wav，否则 record 段没有容器头、客户端无法识别。
+RAW_PCM_SAMPLE_RATE = 24000
+RAW_PCM_CHANNELS = 1
+RAW_PCM_SAMPLE_WIDTH = 2  # s16le = 2 字节/样本
+RAW_PCM_FORMATS: frozenset[str] = frozenset({"pcm", "pcm16"})
+
+
+def wrap_raw_pcm_to_wav(
+    pcm: bytes,
+    sample_rate: int = RAW_PCM_SAMPLE_RATE,
+    channels: int = RAW_PCM_CHANNELS,
+    sample_width: int = RAW_PCM_SAMPLE_WIDTH,
+) -> bytes:
+    """给裸 PCM 套一个标准 44 字节 RIFF/WAVE 头。
+
+    不依赖 ffmpeg：PCM 本来就是 wav 的负载，只是缺头；用标准库 struct
+    直接拼，避免为了「加个 44 字节的头」再起一个子进程（发送路径上多一次
+    ffmpeg 调用就多一份超时风险）。
+
+    采样参数必须与上游一致（s16le/24kHz/单声道），否则播放速度会不对。
+    """
+    import struct
+
+    if not pcm:
+        return b""
+
+    block_align = channels * sample_width
+    byte_rate = sample_rate * block_align
+    data_size = len(pcm)
+    # RIFF 头里的 chunk size 是 32 位有符号，超 4GB 会溢出（实际不可能，
+    # 但保险起见按上限截断，宁可少报也不产出非法文件）。
+    riff_size = min(36 + data_size, 0xFFFFFFFF)
+
+    header = struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        riff_size,
+        b"WAVE",
+        b"fmt ",
+        16,           # fmt chunk 长度
+        1,            # PCM
+        channels,
+        sample_rate,
+        byte_rate,
+        block_align,
+        sample_width * 8,
+        b"data",
+        data_size,
+    )
+    return header + pcm
+
+
 # 半音 -> 频率倍率。rubberband 的 pitch 参数直接吃这个倍率。
 _SEMITONE_RATIO = 2.0 ** (1.0 / 12.0)
 

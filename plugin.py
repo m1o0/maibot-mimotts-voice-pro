@@ -16,9 +16,13 @@ except ImportError:
     from tts_service import MiMoTTSService
 
 try:
-    from .audio_processor import AudioProcessor, build_audio_processor
+    from .audio_processor import (
+        AudioProcessor, RAW_PCM_FORMATS, build_audio_processor, wrap_raw_pcm_to_wav,
+    )
 except ImportError:
-    from audio_processor import AudioProcessor, build_audio_processor
+    from audio_processor import (  # type: ignore[no-redef]
+        AudioProcessor, RAW_PCM_FORMATS, build_audio_processor, wrap_raw_pcm_to_wav,
+    )
 
 
 # 语音失败降级发文字时，剥掉只对 TTS 有意义的语气标签，例如
@@ -61,6 +65,9 @@ def _strip_audio_tags(text: str) -> str:
 # 内网 / 本机网段：请求打到这些地址时，API Key 只会在局域网内暴露，风险相对可控，
 # 但仍值得提示——用户可能以为自己连的是公网服务。
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"})
+
+# 发送前需要先封成 wav 的裸流格式（无容器头，QQ 侧无法识别）。
+_RAW_PCM_FORMATS = RAW_PCM_FORMATS
 
 
 def _describe_insecure_base_url(raw_url: str) -> str:
@@ -115,7 +122,7 @@ class VoiceSectionConfig(PluginConfigBase):
     voices_dir: str = Field(default="voices", description="音色目录路径（相对于插件目录）")
     default_voice: str = Field(default="", description="默认音色名称（clone模式下为音频文件名）")
     clone_voice: str = Field(default="", description="复刻音色文件名（clone模式下优先使用）")
-    audio_format: str = Field(default="mp3", description="合成音频格式：wav / mp3 / pcm / pcm16（mp3 体积约 wav 的 1/6）")
+    audio_format: str = Field(default="mp3", description="合成音频格式：wav / mp3 / pcm / pcm16（mp3 体积约 wav 的 1/6；pcm/pcm16 为裸流，发送前自动套 wav 头）")
 
 
 class RequestSectionConfig(PluginConfigBase):
@@ -506,12 +513,38 @@ class AIVoicePlugin(MaiBotPlugin):
             self.ctx.logger.warning("音频 base64 重新编码失败，使用原始音频: %r", exc)
             return audio_b64
 
+    async def _wrap_raw_pcm_to_wav(self, audio_b64: str) -> str:
+        """把裸 PCM 的 base64 封成 wav 的 base64；失败原样返回。
+
+        上游 `audio_format=pcm/pcm16` 返回的是无头裸流，直接 base64 塞进
+        QQ 的 record 段会失败或变成噪音。封 wav 是纯字节拼接（不需要
+        ffmpeg），失败也只退化成原样发送，不影响其它路径。
+        """
+        if not audio_b64:
+            return audio_b64
+        try:
+            raw = base64.b64decode(audio_b64, validate=False)
+            if not raw:
+                return audio_b64
+            wrapped = wrap_raw_pcm_to_wav(raw)
+            out = base64.b64encode(wrapped).decode("ascii")
+            self.ctx.logger.info(
+                "裸 PCM 已封装为 wav：%d -> %d 字节（带 44 字节头）", len(raw), len(wrapped)
+            )
+            return out
+        except Exception as exc:  # noqa: BLE001
+            self.ctx.logger.warning("裸 PCM 封装 wav 失败，按原样发送: %r", exc)
+            return audio_b64
+
     async def _send_voice(self, audio_b64: str, stream_id: str) -> bool:
         """Send voice message using base64 format.
 
         宿主 send.custom 对 "voice" 类型会把 content 当作纯 base64 交给
         VoiceComponent（适配器再走 binary_data_base64），而 "record" 类型只会
         落到 DictComponent 原样透传，NapCat 静默失败却不报错。因此先走 voice。
+
+        注意：routing 层面的两种发法都是「把 base64 原样塞进 record」，QQ 侧
+        无法识别裸 PCM（无容器头）。所以调用方必须确保传进来的是 wav/mp3。
         """
         self.ctx.logger.info("Sending voice to stream=%s, b64_len=%d", stream_id, len(audio_b64))
 
@@ -639,6 +672,12 @@ class AIVoicePlugin(MaiBotPlugin):
                 if self.audio_processor is not None:
                     audio_b64 = await self._apply_audio_processing(audio_b64, audio_format)
 
+                # 裸 PCM 没有容器头，QQ 无法识别（适配器只是把 base64 原样塞进
+                # {"type":"record"}，不做转码），发出去要么失败要么是噪音。
+                # 这里封装成 wav 再发，保证 audio_format 填 pcm/pcm16 也真的能用。
+                if audio_format in _RAW_PCM_FORMATS:
+                    audio_b64 = await self._wrap_raw_pcm_to_wav(audio_b64)
+
                 # 把发送结果也纳入 success，否则「合成成功但发不出去」
                 # 会被当成成功，用户收不到任何东西。
                 sent = await self._send_voice(audio_b64, stream_id)
@@ -647,8 +686,15 @@ class AIVoicePlugin(MaiBotPlugin):
                     result["success"] = False
                     result["error"] = "voice send failed"
             elif audio_b64:
-                # 不需要发送时也清理
-                result.pop("audio_base64", None)
+                # 不传 stream_id = 调用方只要音频、不要发送（见 README「不传则
+                # 只合成、不发送」）。这里绝不能把 audio_base64 删掉：删了调用
+                # 方会拿到 {"success": True} 却没有音频，静默失败且无从排查。
+                # 只做一件事——把 data URI 前缀剥成纯 base64，和发送路径保持
+                # 一致的返回形态。
+                if "base64," in audio_b64:
+                    result["audio_base64"] = audio_b64.split("base64,", 1)[1].strip()
+                else:
+                    result["audio_base64"] = audio_b64.strip()
 
             return result
         except Exception as e:

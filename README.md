@@ -151,7 +151,7 @@ ffmpeg 处理约 0.2~0.5 秒（一段 8 秒语音）。找不到 ffmpeg 时只�
 | `voices_dir` | 音色复刻目录。**必须是插件目录内的相对路径**，写绝对路径或 `../` 会被拒绝并回退到 `voices` | `voices` |
 | `default_voice` | clone 模式默认音色（文件名，不含扩展名） | - |
 | `clone_voice` | clone 模式兜底音色 | - |
-| `audio_format` | `wav` / `mp3` / `pcm` / `pcm16`。`mp3` 体积约为 `wav` 的 1/6 | `mp3` |
+| `audio_format` | `wav` / `mp3` / `pcm` / `pcm16`。`mp3` 体积约为 `wav` 的 1/6。`pcm` / `pcm16` 是**无容器头裸流**，插件在发送前会自动套上 44 字节 wav 头再发（QQ 侧只认带容器的音频），返回值里的 `audio_base64` 仍是上游原始裸流 | `mp3` |
 
 ### `[request]`
 
@@ -272,7 +272,7 @@ result = await plugin_call("m1o0.maibot-mimotts-voice-pro", "voice_clone_tts", {
 
 `voice_name` 传的是 `voices_dir` 里的文件名（不含扩展名），或 `preset` 模式下的预置音色 ID。
 
-注意 `stream_id` 的语义：**传了就会真的把语音发进那个会话**，不只是返回音频数据。不传则只合成、不发送，`result["audio_base64"]` 里是原始音频。这一点对所有调用方都成立 —— 一旦你接上了这个 API，发送目标就不再受本插件「聊天流定位」那套规则约束，调用方给什么流就发什么流。
+注意 `stream_id` 的语义：**传了就会真的把语音发进那个会话**，不只是返回音频数据。不传则只合成、不发送，`result["audio_base64"]` 里是原始音频（纯 base64，不含 `data:` 前缀，`audio_format` 是什么它就是什么——`pcm` / `pcm16` 时是未加头的裸流）。这一点对所有调用方都成立 —— 一旦你接上了这个 API，发送目标就不再受本插件「聊天流定位」那套规则约束，调用方给什么流就发什么流。
 
 ## 常见问题
 
