@@ -6,7 +6,7 @@
 
 基于小米 MiMo-V2.5-TTS 的语音插件，把文字回复变成有情绪、有音色、有停顿的语音。
 
-![version](https://img.shields.io/badge/version-1.9.10-blue)
+![version](https://img.shields.io/badge/version-1.9.12-blue)
 ![python](https://img.shields.io/badge/python-3.10%2B-3776AB)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![platform](https://img.shields.io/badge/MaiBot-%E2%89%A51.0.0-orange)
@@ -30,7 +30,7 @@
 
 上游版本停在 v1.6.0（2026-05），这个 fork 在其基础上重做了错误处理链路，并新增本地音频后处理。
 
-| | 上游 v1.6.0 | 本 fork v1.9.9 |
+| | 上游 v1.6.0 | 本 fork v1.9.12 |
 |---|---|---|
 | 聊天流定位 | 拿不到时取「第一个群会话」 | 三级优先级，多群时放弃而非串群 |
 | 合成超时 | 会话级硬编码 60s，超时静默失败 | 每请求独立超时，超时改发文字 |
@@ -124,7 +124,7 @@ MiMo 接口**忽略** `speed`、`emotion` 等参数（实测传与不传，返�
 | `0` | 不变 | 原样 |
 | `+1` | 约 +6% | 更幼更尖 |
 
-> 不知道调多少就从 `-1` 或 `-1.5` 开始。超过 `-3` 会从「少女」滑向「成年女性」，配猫娘一类人设容易不搭。
+> 不知道调多少就从 `-1` 或 `-1.5` 开始。超过 `-3` 会从「少女」滑向「成年女性」，配偏幼的人设容易不搭。
 
 一个常见组合（更柔和的少女音）：
 
@@ -266,7 +266,7 @@ result = await plugin_call("m1o0.maibot-mimotts-voice-pro", "voice_clone_tts", {
     "text": "要朗读的文本",
     "stream_id": "目标聊天流",        # 传了就真的会发语音出去
     "style_instruction": "语气描述",   # 可选
-    "voice_name": "luoxi",            # 可选，不传用默认音色
+    "voice_name": "my_voice",         # 可选，不传用默认音色
 })
 ```
 

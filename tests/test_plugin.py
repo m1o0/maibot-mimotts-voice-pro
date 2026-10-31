@@ -85,7 +85,7 @@ def make_plugin():
     p = object.__new__(P.AIVoicePlugin)
     p.tts_service = None
     p.voices = {}
-    p.default_voice = "luoxi"
+    p.default_voice = "my_voice"
     p._voice_inflight = set()
     p._background_tasks = set()
     p._ctx = types.SimpleNamespace(logger=FakeLogger())
@@ -358,12 +358,12 @@ async def test_load_voices():
     check("重载后不含上传前残留的旧音色", "stale_voice" not in p.voices, str(list(p.voices.keys())))
     # 仓库里不带 voices/（被 .gitignore 排除，音色由用户自己放），
     # 所以这条只在运行目录下跑测试时才断真实文件，仓库里只断言「不崩且清掉了旧音色」。
-    if (PLUGIN_DIR / "voices" / "luoxi.mp3").is_file():
-        check("加载到真实音色 luoxi", "luoxi" in p.voices, str(list(p.voices.keys())))
-        if "luoxi" in p.voices:
-            check("音色带 data URI 前缀", p.voices["luoxi"].startswith("data:audio/"), p.voices["luoxi"][:40])
+    if (PLUGIN_DIR / "voices" / "my_voice.mp3").is_file():
+        check("加载到真实音色 my_voice", "my_voice" in p.voices, str(list(p.voices.keys())))
+        if "my_voice" in p.voices:
+            check("音色带 data URI 前缀", p.voices["my_voice"].startswith("data:audio/"), p.voices["my_voice"][:40])
     else:
-        print("  ⏭  跳过 luoxi 真实音色断言（当前目录没有 voices/luoxi.mp3）")
+        print("  ⏭  跳过 my_voice 真实音色断言（当前目录没有 voices/my_voice.mp3）")
 
     # 指向不存在的目录 → 清空且不崩
     _set_config(p, P.VoicePluginConfig(voice={"voices_dir": "__no_such_dir__"}))
@@ -469,15 +469,15 @@ async def test_load_voices_keeps_old_on_partial_failure():
 def test_resolve_voice():
     print("\n=== 7. _resolve_voice ===")
     p = make_plugin()
-    p.voices = {"luoxi": "data:audio/mpeg;base64,X", "other": "data:audio/mpeg;base64,Y"}
-    p.default_voice = "luoxi"
+    p.voices = {"my_voice": "data:audio/mpeg;base64,X", "other": "data:audio/mpeg;base64,Y"}
+    p.default_voice = "my_voice"
     _set_config(p, P.VoicePluginConfig(voice={"voice_mode": "clone", "clone_voice": "other"}))
 
     key, audio, mode = p._resolve_voice("")
-    check("空名用 default_voice", key == "luoxi" and mode == "clone", f"{key},{mode}")
+    check("空名用 default_voice", key == "my_voice" and mode == "clone", f"{key},{mode}")
 
     key, audio, mode = p._resolve_voice("default")
-    check("'default' 用 default_voice", key == "luoxi", key)
+    check("'default' 用 default_voice", key == "my_voice", key)
 
     key, audio, mode = p._resolve_voice("other")
     check("指定存在的音色", key == "other", key)
@@ -489,7 +489,7 @@ def test_resolve_voice():
     key, audio, mode = p._resolve_voice("anything")
     check("无音色时返回空", key == "" and mode == "", f"{key},{mode}")
 
-    p.voices = {"luoxi": "x"}
+    p.voices = {"my_voice": "x"}
     _set_config(p, P.VoicePluginConfig(voice={"voice_mode": "preset", "preset_voice": "冰糖"}))
     key, audio, mode = p._resolve_voice("")
     check("preset 模式返回预置名", key == "冰糖" and mode == "preset", f"{key},{mode}")
@@ -500,8 +500,8 @@ async def test_audio_format():
     print("\n=== 8. audio_format 校验 ===")
     p = make_plugin()
     _set_config(p, P.VoicePluginConfig(voice={"voice_mode": "clone", "audio_format": "opus"}))
-    p.voices = {"luoxi": "data:audio/mpeg;base64,X"}
-    p.default_voice = "luoxi"
+    p.voices = {"my_voice": "data:audio/mpeg;base64,X"}
+    p.default_voice = "my_voice"
 
     captured = {}
 
@@ -551,8 +551,8 @@ async def test_audio_base64_kept_without_stream():
     print("\n=== 8b. 不传 stream_id 保留音频 ===")
     p = make_plugin()
     _set_config(p, P.VoicePluginConfig(voice={"voice_mode": "clone", "audio_format": "mp3"}))
-    p.voices = {"luoxi": "data:audio/mpeg;base64,REF"}
-    p.default_voice = "luoxi"
+    p.voices = {"my_voice": "data:audio/mpeg;base64,REF"}
+    p.default_voice = "my_voice"
     p.audio_processor = None
     p.ctx.send = FakeSendCustom()
 
@@ -605,8 +605,8 @@ async def test_raw_pcm_wrapped_before_send():
     # 再走完整链路
     p = make_plugin()
     _set_config(p, P.VoicePluginConfig(voice={"voice_mode": "clone", "audio_format": "pcm"}))
-    p.voices = {"luoxi": "data:audio/mpeg;base64,REF"}
-    p.default_voice = "luoxi"
+    p.voices = {"my_voice": "data:audio/mpeg;base64,REF"}
+    p.default_voice = "my_voice"
     p.audio_processor = None
     p.ctx.send = FakeSendCustom()
 

@@ -615,7 +615,7 @@ class AIVoicePlugin(MaiBotPlugin):
             return "", "", ""
 
         # preset 模式：只认显式传入的音色名或 preset_voice。
-        # 不能回落到 default_voice —— 那是 clone 模式下的音频文件名（如 "luoxi"），
+        # 不能回落到 default_voice —— 那是 clone 模式下的音频文件名（如 "my_voice"），
         # 当成预置音色 ID 发出去会被上游拒绝。
         preset_id = explicit or self.config.voice.preset_voice or "mimo_default"
         return preset_id, "", "preset"

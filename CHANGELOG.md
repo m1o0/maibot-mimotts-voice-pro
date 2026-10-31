@@ -2,6 +2,15 @@
 
 本文件记录插件各版本的变化。遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.9.12] - 2026-10-31
+
+### 变更
+
+- 文档、注释与测试里的示例音色名从实际使用的文件名换成通用的 `my_voice`（README 的 API 调用示例、`plugin.py` 的说明注释、`CHANGELOG` 的历史条目、`tests/test_plugin.py` 的 20 处桩数据）。
+- README 里音高调节的说明不再举具体人设类型做例子。
+
+功能代码未变，115 项回归测试全部通过。
+
 ## [1.9.11] - 2026-10-29
 
 ### 修复
@@ -294,7 +303,7 @@
   未被持有，asyncio 只对任务做弱引用，任务可能在合成途中被 GC 回收，表现为
   日志停在 `TTS request` 之后没有下文。现在把任务存入集合持有强引用。
 - **修复 preset 模式下音色 ID 取错的问题**。`default_voice` 是 clone 模式的参考
-  音频文件名（如 `luoxi`），preset 模式此前会把它当作预置音色 ID 发给上游而被拒。
+  音频文件名（如 `my_voice`），preset 模式此前会把它当作预置音色 ID 发给上游而被拒。
   现在 preset 模式只认显式传入的音色名或 `preset_voice`。
 - **修复热重载后 API Key 清空不生效的问题**。原实现仅在「新 key 非空」时才更新，
   把 key 清空后旧 key 仍留在内存中继续计费；`base_url` 同样会残留。现在配置变更
